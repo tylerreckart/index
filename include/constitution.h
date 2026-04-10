@@ -1,0 +1,46 @@
+#pragma once
+// claudius/include/constitution.h — Constitution system
+// Master constitution (caveman-derived) + per-agent personality overlays.
+
+#include <string>
+#include <vector>
+#include <optional>
+
+namespace claudius {
+
+// Caveman compression level
+enum class Brevity { Lite, Full, Ultra };
+
+struct Constitution {
+    // --- Core identity ---
+    std::string name;
+    std::string role;               // e.g. "code-reviewer", "researcher", "devops"
+    std::string personality;        // free-form personality overlay
+
+    // --- Behavioral rules ---
+    Brevity brevity = Brevity::Full;
+    int     max_tokens = 1024;      // response cap
+    double  temperature = 0.3;      // low = deterministic
+    std::string model = "claude-sonnet-4-20250514";
+
+    // --- System prompt pieces ---
+    std::string goal;               // what this agent is trying to accomplish
+    std::vector<std::string> rules; // explicit behavioral constraints
+
+    // --- Computed ---
+    std::string build_system_prompt() const;
+
+    // --- Serialization ---
+    std::string to_json() const;
+    static Constitution from_json(const std::string& json_str);
+    static Constitution from_file(const std::string& path);
+    void save(const std::string& path) const;
+};
+
+// Master constitution — caveman-derived defaults
+Constitution master_constitution();
+
+std::string brevity_to_string(Brevity b);
+Brevity brevity_from_string(const std::string& s);
+
+} // namespace claudius
