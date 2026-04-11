@@ -26,18 +26,21 @@
 #include <map>
 #include <queue>
 #include <sstream>
+#include <ctime>
+#include <cstdio>
 
 namespace fs = std::filesystem;
 
-static const char* BANNER = R"(
-   _____ _                 _ _
-  / ____| |               | (_)
- | |    | | __ _ _   _  __| |_ _   _ ___
- | |    | |/ _` | | | |/ _` | | | | / __|
- | |____| | (_| | |_| | (_| | | |_| \__ \
-  \_____|_|\__,_|\__,_|\__,_|_|\__,_|___/
-                                    v0.1.1
-)";
+static const char* BANNER =
+    "\033[38;5;208m"
+    "   _____ _                 _ _\n"
+    "  / ____| |               | (_)\n"
+    " | |    | | __ _ _   _  __| |_ _   _ ___\n"
+    " | |    | |/ _` | | | |/ _` | | | | / __|\n"
+    " | |____| | (_| | |_| | (_| | | |_| \\__ \\\n"
+    "  \\_____|_|\\__,_|\\__,_|\\__,_|_|\\__,_|___/\n"
+    "                                    v0.1.2\n"
+    "\033[0m";
 
 static std::string get_config_dir() {
     const char* home = std::getenv("HOME");
@@ -45,6 +48,68 @@ static std::string get_config_dir() {
     std::string dir = std::string(home) + "/.claudius";
     fs::create_directories(dir);
     return dir;
+}
+
+static std::string get_memory_dir() {
+    std::string dir = get_config_dir() + "/memory";
+    fs::create_directories(dir);
+    return dir;
+}
+
+// Append a timestamped entry to an agent's memory file.
+static void write_memory(const std::string& agent_id, const std::string& text) {
+    std::string path = get_memory_dir() + "/" + agent_id + ".md";
+    std::ofstream f(path, std::ios::app);
+    if (!f.is_open()) {
+        std::cerr << "ERR: cannot write memory: " << path << "\n";
+        return;
+    }
+    // Timestamp
+    std::time_t now = std::time(nullptr);
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+    f << "\n<!-- " << ts << " -->\n" << text << "\n";
+}
+
+// Read an agent's memory file. Returns empty string if none exists.
+static std::string read_memory(const std::string& agent_id) {
+    std::string path = get_memory_dir() + "/" + agent_id + ".md";
+    std::ifstream f(path);
+    if (!f.is_open()) return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+// Fetch raw HTML from a URL using curl. Returns content or error string.
+// URL is validated to start with http:// or https:// to prevent injection.
+static std::string fetch_url(const std::string& url) {
+    // Validate: must start with http:// or https://
+    if (url.substr(0, 7) != "http://" && url.substr(0, 8) != "https://") {
+        return "ERR: URL must start with http:// or https://";
+    }
+    // Reject shell metacharacters
+    for (char c : url) {
+        if (c == '\'' || c == '"' || c == '`' || c == '$' ||
+            c == ';'  || c == '&' || c == '|' || c == '>' ||
+            c == '<'  || c == '\n'|| c == '\r') {
+            return "ERR: URL contains invalid characters";
+        }
+    }
+
+    std::string cmd = "curl -sL --max-time 15 --max-filesize 524288 '" + url + "' 2>&1";
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return "ERR: failed to run curl";
+
+    std::string result;
+    result.reserve(65536);
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        result += buf;
+        if (result.size() > 512 * 1024) break; // cap at 512KB
+    }
+    pclose(pipe);
+    return result;
 }
 
 static std::string get_api_key() {
@@ -257,6 +322,9 @@ struct LoopEntry {
     bool stop_req    = false;
     bool suspend_req = false;
 
+    // Buffered output — loop runs silently; pull via /log <id>
+    std::vector<std::string> output_log;
+
     std::thread thread;
 
     LoopEntry() = default;
@@ -354,7 +422,34 @@ public:
                << "  state:" << loop_state_str(e->state)
                << "  iter:" << e->iter
                << "  elapsed:" << secs << "s\n";
+            if (!e->last_output.empty()) {
+                // Show truncated last output as preview
+                std::string preview = e->last_output.substr(
+                    0, std::min<size_t>(120, e->last_output.size()));
+                // Replace newlines with spaces for single-line preview
+                for (char& c : preview) if (c == '\n') c = ' ';
+                ss << "    last: " << preview;
+                if (e->last_output.size() > 120) ss << "...";
+                ss << "\n";
+            }
         }
+        return ss.str();
+    }
+
+    // Return buffered log for a loop. N=0 means all.
+    std::string log(const std::string& lid, int last_n = 0) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = loops_.find(lid);
+        if (it == loops_.end()) return "ERR: no loop '" + lid + "'\n";
+        const auto& entries = it->second->output_log;
+        if (entries.empty()) return "  (no output yet)\n";
+
+        std::ostringstream ss;
+        int start = 0;
+        if (last_n > 0 && static_cast<int>(entries.size()) > last_n)
+            start = static_cast<int>(entries.size()) - last_n;
+        for (int i = start; i < static_cast<int>(entries.size()); ++i)
+            ss << entries[i];
         return ss.str();
     }
 
@@ -374,44 +469,62 @@ public:
 private:
     static void run_loop(LoopEntry* e, claudius::Orchestrator& orch,
                          std::string initial_prompt) {
-        std::string prompt = std::move(initial_prompt);
+        // First iteration uses the initial prompt.
+        // Subsequent iterations send "Continue." — the agent already has its
+        // prior output in conversation history, so feeding the raw output back
+        // as a user message would make it appear to be echoed by a human.
+        std::string prompt = initial_prompt;
+        bool first = true;
+
         while (true) {
             // Wait out any suspension (or stop)
             {
                 std::unique_lock<std::mutex> lk(e->mu);
                 e->cv.wait(lk, [e]{ return !e->suspend_req || e->stop_req; });
                 if (e->stop_req) break;
-                // Consume an injected prompt if one arrived
+                // Injected prompt resets the turn
                 if (!e->injected.empty()) {
                     prompt = e->injected.front();
                     e->injected.pop();
+                    first = true;
                 }
             }
 
             auto resp = orch.send(e->agent_id, prompt);
             e->iter++;
 
+            // Buffer output; do NOT flood the interactive session.
             {
-                std::lock_guard<std::mutex> out(g_out_mu);
-                std::cout << "\n[" << e->loop_id << "/" << e->agent_id
-                          << " #" << e->iter << "]\n";
+                std::ostringstream entry;
+                entry << "[" << e->loop_id << "/" << e->agent_id
+                      << " #" << e->iter << "]\n";
                 if (resp.ok) {
-                    std::cout << resp.content << "\n"
-                              << "  [in:" << resp.input_tokens
-                              << " out:" << resp.output_tokens << "]\n";
+                    entry << resp.content << "\n"
+                          << "  [in:" << resp.input_tokens
+                          << " out:" << resp.output_tokens << "]\n";
                     e->last_output = resp.content;
-                    prompt = resp.content; // feed response back as next prompt
                 } else {
-                    std::cout << "ERR: " << resp.error << "\n";
-                    break;
+                    entry << "ERR: " << resp.error << "\n";
                 }
+                std::lock_guard<std::mutex> ek(e->mu);
+                e->output_log.push_back(entry.str());
             }
+
+            if (!resp.ok) break;
+
+            // Don't feed output back as prompt — that causes the agent to
+            // believe its own text is being echoed by a human, producing
+            // infinite confusion. History already carries the prior response.
+            if (first) {
+                first = false;
+            }
+            prompt = "Continue.";
 
             // Re-check stop before sleeping
             { std::lock_guard<std::mutex> lk(e->mu); if (e->stop_req) break; }
 
             // Brief pause between iterations to avoid hammering the API
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::this_thread::sleep_for(std::chrono::seconds(2));
         }
         e->state = LoopState::Stopped;
     }
@@ -623,26 +736,149 @@ static void cmd_interactive() {
                     std::cout << "ERR: no loop '" << lid << "'\n";
                 continue;
             }
+            if (cmd == "log") {
+                std::string lid;
+                iss >> lid;
+                if (lid.empty()) {
+                    std::cout << "Usage: /log <loop-id> [last-N]\n";
+                    continue;
+                }
+                int n = 0;
+                iss >> n;
+                std::cout << loops.log(lid, n);
+                continue;
+            }
+            if (cmd == "fetch") {
+                std::string url;
+                iss >> url;
+                if (url.empty()) {
+                    std::cout << "Usage: /fetch <url>\n";
+                    continue;
+                }
+                std::cout << "fetching " << url << "...\n";
+                std::string content = fetch_url(url);
+                if (content.substr(0, 4) == "ERR:") {
+                    std::cout << content << "\n";
+                    continue;
+                }
+                // Inject into current agent as a user message
+                std::string msg = "[FETCHED: " + url + "]\n" + content +
+                                  "\n[END FETCHED]\n";
+                try {
+                    thinking.start();
+                    auto resp = orch.send(current_agent, msg);
+                    thinking.stop();
+                    std::lock_guard<std::mutex> out(g_out_mu);
+                    if (resp.ok) {
+                        std::cout << resp.content << "\n";
+                        std::cout << "  [in:" << resp.input_tokens
+                                  << " out:" << resp.output_tokens << "]\n";
+                    } else {
+                        std::cout << "ERR: " << resp.error << "\n";
+                    }
+                } catch (const std::exception& ex) {
+                    thinking.stop();
+                    std::cout << "ERR: " << ex.what() << "\n";
+                }
+                continue;
+            }
+            if (cmd == "mem") {
+                std::string subcmd;
+                iss >> subcmd;
+                if (subcmd == "write") {
+                    std::string text;
+                    std::getline(iss, text);
+                    if (!text.empty() && text[0] == ' ') text.erase(0, 1);
+                    if (text.empty()) {
+                        std::cout << "Usage: /mem write <text>\n";
+                        continue;
+                    }
+                    write_memory(current_agent, text);
+                    std::cout << "Memory written for " << current_agent << "\n";
+                } else if (subcmd == "read") {
+                    std::string mem = read_memory(current_agent);
+                    if (mem.empty()) {
+                        std::cout << "No memory for " << current_agent << "\n";
+                        continue;
+                    }
+                    // Inject memory into agent context
+                    std::string msg = "[MEMORY for " + current_agent + "]:\n" +
+                                      mem + "\n[END MEMORY]\n";
+                    try {
+                        thinking.start();
+                        auto resp = orch.send(current_agent, msg);
+                        thinking.stop();
+                        std::lock_guard<std::mutex> out(g_out_mu);
+                        if (resp.ok) {
+                            std::cout << resp.content << "\n";
+                            std::cout << "  [in:" << resp.input_tokens
+                                      << " out:" << resp.output_tokens << "]\n";
+                        } else {
+                            std::cout << "ERR: " << resp.error << "\n";
+                        }
+                    } catch (const std::exception& ex) {
+                        thinking.stop();
+                        std::cout << "ERR: " << ex.what() << "\n";
+                    }
+                } else if (subcmd == "show") {
+                    std::string mem = read_memory(current_agent);
+                    if (mem.empty())
+                        std::cout << "No memory for " << current_agent << "\n";
+                    else
+                        std::cout << mem << "\n";
+                } else if (subcmd == "clear") {
+                    std::string path = get_memory_dir() + "/" + current_agent + ".md";
+                    fs::remove(path);
+                    std::cout << "Memory cleared for " << current_agent << "\n";
+                } else {
+                    std::cout << "Usage: /mem write <text> | /mem read | /mem show | /mem clear\n";
+                }
+                continue;
+            }
+            if (cmd == "model") {
+                std::string id, model;
+                iss >> id >> model;
+                if (id.empty() || model.empty()) {
+                    std::cout << "Usage: /model <agent-id> <model-id>\n";
+                    std::cout << "  e.g. /model researcher claude-haiku-4-5-20251001\n";
+                    continue;
+                }
+                try {
+                    orch.get_agent(id).config_mut().model = model;
+                    std::cout << id << " model -> " << model << "\n";
+                } catch (const std::exception& ex) {
+                    std::cout << "ERR: " << ex.what() << "\n";
+                }
+                continue;
+            }
             if (cmd == "help") {
                 std::cout << "Commands:\n"
-                    "  /send <agent> <msg>         — send to specific agent\n"
-                    "  /ask <query>                — ask claudius master\n"
-                    "  /use <agent>                — switch current agent\n"
-                    "  /list                       — list agents\n"
-                    "  /status                     — system status\n"
-                    "  /tokens                     — token usage\n"
-                    "  /create <id>                — create agent (default config)\n"
-                    "  /remove <id>                — remove agent\n"
-                    "  /reset [id]                 — clear agent history\n"
+                    "  /send <agent> <msg>              — send to specific agent\n"
+                    "  /ask <query>                     — ask claudius master\n"
+                    "  /use <agent>                     — switch current agent\n"
+                    "  /list                            — list agents\n"
+                    "  /status                          — system status\n"
+                    "  /tokens                          — token usage\n"
+                    "  /create <id>                     — create agent (default config)\n"
+                    "  /remove <id>                     — remove agent\n"
+                    "  /reset [id]                      — clear agent history\n"
+                    "  /model <agent> <model-id>        — change agent model at runtime\n"
                     "\n"
-                    "  /loop <agent> <prompt>      — run agent in autonomous loop\n"
-                    "  /loops                      — list running/suspended loops\n"
-                    "  /kill <loop-id>             — stop a loop\n"
-                    "  /suspend <loop-id>          — pause a loop\n"
-                    "  /resume <loop-id>           — resume a paused loop\n"
-                    "  /inject <loop-id> <msg>     — send message into a running loop\n"
+                    "  /loop <agent> <prompt>           — run agent in background loop\n"
+                    "  /loops                           — list running/suspended loops\n"
+                    "  /log <loop-id> [last-N]          — show buffered loop output\n"
+                    "  /kill <loop-id>                  — stop a loop\n"
+                    "  /suspend <loop-id>               — pause a loop\n"
+                    "  /resume <loop-id>                — resume a paused loop\n"
+                    "  /inject <loop-id> <msg>          — send message into a running loop\n"
                     "\n"
-                    "  /quit                       — exit\n"
+                    "  /fetch <url>                     — fetch URL and send HTML to current agent\n"
+                    "  /mem write <text>                — append note to agent memory\n"
+                    "  /mem read                        — load memory into agent context\n"
+                    "  /mem show                        — print raw memory file\n"
+                    "  /mem clear                       — delete agent memory file\n"
+                    "\n"
+                    "  /quit                            — exit\n"
                     "\n"
                     "Plain text sends to current agent.\n";
                 continue;
