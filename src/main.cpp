@@ -19,6 +19,13 @@
 #include <csignal>
 #include <filesystem>
 #include <fstream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <map>
+#include <queue>
+#include <sstream>
 
 namespace fs = std::filesystem;
 
@@ -194,6 +201,227 @@ static void cmd_serve(int port) {
     std::cout << "Final stats: " << orch.global_status() << "\n";
 }
 
+class ThinkingIndicator {
+public:
+    void start() {
+        running_ = true;
+        thread_ = std::thread([this]() {
+            static const char* frames[] = {"   ", ".  ", ".. ", "..."};
+            int i = 0;
+            while (running_.load()) {
+                std::cout << "\rthinking" << frames[i % 4] << std::flush;
+                ++i;
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            }
+            std::cout << "\r            \r" << std::flush;
+        });
+    }
+
+    void stop() {
+        running_ = false;
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    std::atomic<bool> running_{false};
+    std::thread thread_;
+};
+
+// Shared output lock: prevents loop thread output from interleaving with
+// interactive responses printed by the main thread.
+static std::mutex g_out_mu;
+
+// ─── Agent loop machinery ────────────────────────────────────────────────────
+
+enum class LoopState { Running, Suspended, Stopped };
+
+static const char* loop_state_str(LoopState s) {
+    switch (s) {
+        case LoopState::Running:   return "running";
+        case LoopState::Suspended: return "suspended";
+        case LoopState::Stopped:   return "stopped";
+    }
+    return "?";
+}
+
+struct LoopEntry {
+    std::string loop_id;
+    std::string agent_id;
+    LoopState   state   = LoopState::Running;
+    int         iter    = 0;
+    std::string last_output;
+    std::chrono::steady_clock::time_point started;
+
+    std::mutex              mu;
+    std::condition_variable cv;
+    std::queue<std::string> injected;
+    bool stop_req    = false;
+    bool suspend_req = false;
+
+    std::thread thread;
+
+    LoopEntry() = default;
+    LoopEntry(const LoopEntry&) = delete;
+    LoopEntry& operator=(const LoopEntry&) = delete;
+};
+
+class LoopManager {
+public:
+    ~LoopManager() {
+        std::unique_lock<std::mutex> lk(mu_);
+        for (auto& [id, e] : loops_) {
+            std::lock_guard<std::mutex> ek(e->mu);
+            e->stop_req = true;
+            e->cv.notify_all();
+        }
+        // Collect threads to join outside the lock
+        std::vector<std::thread*> threads;
+        for (auto& [id, e] : loops_) threads.push_back(&e->thread);
+        lk.unlock();
+        for (auto* t : threads) if (t->joinable()) t->join();
+    }
+
+    // Start a new loop; returns the loop ID.
+    std::string start(claudius::Orchestrator& orch,
+                      const std::string& agent_id,
+                      const std::string& initial_prompt) {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::string lid = "loop-" + std::to_string(next_id_++);
+        auto e = std::make_unique<LoopEntry>();
+        e->loop_id  = lid;
+        e->agent_id = agent_id;
+        e->started  = std::chrono::steady_clock::now();
+        e->state    = LoopState::Running;
+        e->thread   = std::thread(run_loop, e.get(), std::ref(orch), initial_prompt);
+        loops_[lid] = std::move(e);
+        return lid;
+    }
+
+    bool kill(const std::string& lid) {
+        std::unique_lock<std::mutex> lk(mu_);
+        auto it = loops_.find(lid);
+        if (it == loops_.end()) return false;
+        auto* e = it->second.get();
+        { std::lock_guard<std::mutex> ek(e->mu); e->stop_req = true; }
+        e->cv.notify_all();
+        auto& t = e->thread;
+        lk.unlock();
+        if (t.joinable()) t.join();
+        lk.lock();
+        loops_.erase(lid);
+        return true;
+    }
+
+    bool suspend(const std::string& lid) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = loops_.find(lid);
+        if (it == loops_.end()) return false;
+        if (it->second->state != LoopState::Running) return false;
+        { std::lock_guard<std::mutex> ek(it->second->mu); it->second->suspend_req = true; }
+        it->second->state = LoopState::Suspended;
+        return true;
+    }
+
+    bool resume(const std::string& lid) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = loops_.find(lid);
+        if (it == loops_.end()) return false;
+        if (it->second->state != LoopState::Suspended) return false;
+        { std::lock_guard<std::mutex> ek(it->second->mu); it->second->suspend_req = false; }
+        it->second->state = LoopState::Running;
+        it->second->cv.notify_all();
+        return true;
+    }
+
+    bool inject(const std::string& lid, const std::string& msg) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = loops_.find(lid);
+        if (it == loops_.end()) return false;
+        { std::lock_guard<std::mutex> ek(it->second->mu); it->second->injected.push(msg); }
+        it->second->cv.notify_all();
+        return true;
+    }
+
+    std::string list() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (loops_.empty()) return "  (no active loops)\n";
+        std::ostringstream ss;
+        auto now = std::chrono::steady_clock::now();
+        for (auto& [lid, e] : loops_) {
+            long secs = std::chrono::duration_cast<std::chrono::seconds>(
+                now - e->started).count();
+            ss << "  " << lid
+               << "  agent:" << e->agent_id
+               << "  state:" << loop_state_str(e->state)
+               << "  iter:" << e->iter
+               << "  elapsed:" << secs << "s\n";
+        }
+        return ss.str();
+    }
+
+    // Reap any loops whose threads have finished
+    void reap_stopped() {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto it = loops_.begin(); it != loops_.end(); ) {
+            if (it->second->state == LoopState::Stopped) {
+                if (it->second->thread.joinable()) it->second->thread.join();
+                it = loops_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+private:
+    static void run_loop(LoopEntry* e, claudius::Orchestrator& orch,
+                         std::string initial_prompt) {
+        std::string prompt = std::move(initial_prompt);
+        while (true) {
+            // Wait out any suspension (or stop)
+            {
+                std::unique_lock<std::mutex> lk(e->mu);
+                e->cv.wait(lk, [e]{ return !e->suspend_req || e->stop_req; });
+                if (e->stop_req) break;
+                // Consume an injected prompt if one arrived
+                if (!e->injected.empty()) {
+                    prompt = e->injected.front();
+                    e->injected.pop();
+                }
+            }
+
+            auto resp = orch.send(e->agent_id, prompt);
+            e->iter++;
+
+            {
+                std::lock_guard<std::mutex> out(g_out_mu);
+                std::cout << "\n[" << e->loop_id << "/" << e->agent_id
+                          << " #" << e->iter << "]\n";
+                if (resp.ok) {
+                    std::cout << resp.content << "\n"
+                              << "  [in:" << resp.input_tokens
+                              << " out:" << resp.output_tokens << "]\n";
+                    e->last_output = resp.content;
+                    prompt = resp.content; // feed response back as next prompt
+                } else {
+                    std::cout << "ERR: " << resp.error << "\n";
+                    break;
+                }
+            }
+
+            // Re-check stop before sleeping
+            { std::lock_guard<std::mutex> lk(e->mu); if (e->stop_req) break; }
+
+            // Brief pause between iterations to avoid hammering the API
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        e->state = LoopState::Stopped;
+    }
+
+    mutable std::mutex mu_;
+    std::map<std::string, std::unique_ptr<LoopEntry>> loops_;
+    int next_id_ = 0;
+};
+
 static void cmd_interactive() {
     std::string dir = get_config_dir();
     std::string api_key = get_api_key();
@@ -210,6 +438,8 @@ static void cmd_interactive() {
     std::cout << "Default: messages go to claudius master.\n\n";
 
     std::string current_agent = "claudius";
+    ThinkingIndicator thinking;
+    LoopManager loops;
 
     while (true) {
         std::cout << "[" << current_agent << "] > ";
@@ -259,7 +489,10 @@ static void cmd_interactive() {
                 std::getline(iss, msg);
                 if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
                 try {
+                    thinking.start();
                     auto resp = orch.send(id, msg);
+                    thinking.stop();
+                    std::lock_guard<std::mutex> out(g_out_mu);
                     if (resp.ok) {
                         std::cout << resp.content << "\n";
                         std::cout << "  [in:" << resp.input_tokens
@@ -268,6 +501,7 @@ static void cmd_interactive() {
                         std::cout << "ERR: " << resp.error << "\n";
                     }
                 } catch (const std::exception& e) {
+                    thinking.stop();
                     std::cout << "ERR: " << e.what() << "\n";
                 }
                 continue;
@@ -277,7 +511,10 @@ static void cmd_interactive() {
                 std::getline(iss, query);
                 if (!query.empty() && query[0] == ' ') query.erase(0, 1);
                 try {
+                    thinking.start();
                     auto resp = orch.ask_claudius(query);
+                    thinking.stop();
+                    std::lock_guard<std::mutex> out(g_out_mu);
                     if (resp.ok) {
                         std::cout << resp.content << "\n";
                         std::cout << "  [in:" << resp.input_tokens
@@ -286,6 +523,7 @@ static void cmd_interactive() {
                         std::cout << "ERR: " << resp.error << "\n";
                     }
                 } catch (const std::exception& e) {
+                    thinking.stop();
                     std::cout << "ERR: " << e.what() << "\n";
                 }
                 continue;
@@ -324,18 +562,88 @@ static void cmd_interactive() {
                 }
                 continue;
             }
+            if (cmd == "loop") {
+                std::string id;
+                iss >> id;
+                std::string prompt;
+                std::getline(iss, prompt);
+                if (!prompt.empty() && prompt[0] == ' ') prompt.erase(0, 1);
+                if (id.empty() || prompt.empty()) {
+                    std::cout << "Usage: /loop <agent> <initial prompt>\n";
+                    continue;
+                }
+                if (id != "claudius" && !orch.has_agent(id)) {
+                    std::cout << "ERR: no agent '" << id << "'\n";
+                    continue;
+                }
+                std::string lid = loops.start(orch, id, prompt);
+                std::cout << "Loop started: " << lid << " (agent: " << id << ")\n";
+                continue;
+            }
+            if (cmd == "loops") {
+                loops.reap_stopped();
+                std::cout << loops.list();
+                continue;
+            }
+            if (cmd == "kill") {
+                std::string lid;
+                iss >> lid;
+                if (loops.kill(lid))
+                    std::cout << "Killed: " << lid << "\n";
+                else
+                    std::cout << "ERR: no loop '" << lid << "'\n";
+                continue;
+            }
+            if (cmd == "suspend") {
+                std::string lid;
+                iss >> lid;
+                if (loops.suspend(lid))
+                    std::cout << "Suspended: " << lid << "\n";
+                else
+                    std::cout << "ERR: no loop '" << lid << "' or not running\n";
+                continue;
+            }
+            if (cmd == "resume") {
+                std::string lid;
+                iss >> lid;
+                if (loops.resume(lid))
+                    std::cout << "Resumed: " << lid << "\n";
+                else
+                    std::cout << "ERR: no loop '" << lid << "' or not suspended\n";
+                continue;
+            }
+            if (cmd == "inject") {
+                std::string lid;
+                iss >> lid;
+                std::string msg;
+                std::getline(iss, msg);
+                if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
+                if (loops.inject(lid, msg))
+                    std::cout << "Injected into " << lid << "\n";
+                else
+                    std::cout << "ERR: no loop '" << lid << "'\n";
+                continue;
+            }
             if (cmd == "help") {
                 std::cout << "Commands:\n"
-                    "  /send <agent> <msg>  — send to specific agent\n"
-                    "  /ask <query>         — ask claudius master\n"
-                    "  /use <agent>         — switch current agent\n"
-                    "  /list                — list agents\n"
-                    "  /status              — system status\n"
-                    "  /tokens              — token usage\n"
-                    "  /create <id>         — create agent (default config)\n"
-                    "  /remove <id>         — remove agent\n"
-                    "  /reset [id]          — clear agent history\n"
-                    "  /quit                — exit\n"
+                    "  /send <agent> <msg>         — send to specific agent\n"
+                    "  /ask <query>                — ask claudius master\n"
+                    "  /use <agent>                — switch current agent\n"
+                    "  /list                       — list agents\n"
+                    "  /status                     — system status\n"
+                    "  /tokens                     — token usage\n"
+                    "  /create <id>                — create agent (default config)\n"
+                    "  /remove <id>                — remove agent\n"
+                    "  /reset [id]                 — clear agent history\n"
+                    "\n"
+                    "  /loop <agent> <prompt>      — run agent in autonomous loop\n"
+                    "  /loops                      — list running/suspended loops\n"
+                    "  /kill <loop-id>             — stop a loop\n"
+                    "  /suspend <loop-id>          — pause a loop\n"
+                    "  /resume <loop-id>           — resume a paused loop\n"
+                    "  /inject <loop-id> <msg>     — send message into a running loop\n"
+                    "\n"
+                    "  /quit                       — exit\n"
                     "\n"
                     "Plain text sends to current agent.\n";
                 continue;
@@ -347,7 +655,10 @@ static void cmd_interactive() {
 
         // Plain text → send to current agent
         try {
+            thinking.start();
             auto resp = orch.send(current_agent, line);
+            thinking.stop();
+            std::lock_guard<std::mutex> out(g_out_mu);
             if (resp.ok) {
                 std::cout << resp.content << "\n";
                 std::cout << "  [in:" << resp.input_tokens
@@ -356,6 +667,7 @@ static void cmd_interactive() {
                 std::cout << "ERR: " << resp.error << "\n";
             }
         } catch (const std::exception& e) {
+            thinking.stop();
             std::cout << "ERR: " << e.what() << "\n";
         }
     }
