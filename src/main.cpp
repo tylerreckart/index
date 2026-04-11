@@ -15,6 +15,7 @@
 #include "constitution.h"
 #include "readline_wrapper.h"
 #include "cost_tracker.h"
+#include "markdown.h"
 
 #include <iostream>
 #include <string>
@@ -597,7 +598,7 @@ private:
                 entry << "[" << e->loop_id << "/" << e->agent_id
                       << " #" << e->iter << "]\n";
                 if (resp.ok) {
-                    entry << resp.content << "\n";
+                    entry << claudius::render_markdown(resp.content) << "\n";
                     if (e->tracker) {
                         std::string model = orch.get_agent_model(e->agent_id);
                         e->tracker->record(e->agent_id, model, resp);
@@ -828,9 +829,15 @@ static void cmd_interactive() {
                 std::getline(iss, msg);
                 if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
                 try {
+                    claudius::MarkdownRenderer md;
                     std::lock_guard<std::mutex> out(g_out_mu);
                     auto resp = orch.send_streaming(id, msg,
-                        [](const std::string& chunk) { std::cout << chunk << std::flush; });
+                        [&md](const std::string& chunk) {
+                            auto s = md.feed(chunk);
+                            if (!s.empty()) std::cout << s << std::flush;
+                        });
+                    auto tail = md.flush();
+                    if (!tail.empty()) std::cout << tail;
                     std::cout << "\n";
                     if (resp.ok) {
                         tracker.record(id, orch.get_agent_model(id), resp);
@@ -848,9 +855,15 @@ static void cmd_interactive() {
                 std::getline(iss, query);
                 if (!query.empty() && query[0] == ' ') query.erase(0, 1);
                 try {
+                    claudius::MarkdownRenderer md;
                     std::lock_guard<std::mutex> out(g_out_mu);
                     auto resp = orch.send_streaming("claudius", query,
-                        [](const std::string& chunk) { std::cout << chunk << std::flush; });
+                        [&md](const std::string& chunk) {
+                            auto s = md.feed(chunk);
+                            if (!s.empty()) std::cout << s << std::flush;
+                        });
+                    auto tail = md.flush();
+                    if (!tail.empty()) std::cout << tail;
                     std::cout << "\n";
                     if (resp.ok) {
                         tracker.record("claudius", orch.get_agent_model("claudius"), resp);
@@ -1052,7 +1065,7 @@ static void cmd_interactive() {
                     thinking.stop();
                     std::lock_guard<std::mutex> out(g_out_mu);
                     if (resp.ok) {
-                        std::cout << resp.content << "\n";
+                        std::cout << claudius::render_markdown(resp.content) << "\n";
                         tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
                         std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model(current_agent)) << "\n";
                     } else {
@@ -1092,7 +1105,7 @@ static void cmd_interactive() {
                         thinking.stop();
                         std::lock_guard<std::mutex> out(g_out_mu);
                         if (resp.ok) {
-                            std::cout << resp.content << "\n";
+                            std::cout << claudius::render_markdown(resp.content) << "\n";
                             tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
                             std::cout << "  " << tracker.format_footer(resp, orch.get_agent_model(current_agent)) << "\n";
                         } else {
@@ -1173,9 +1186,15 @@ static void cmd_interactive() {
 
         // Plain text → stream to current agent
         try {
+            claudius::MarkdownRenderer md;
             std::lock_guard<std::mutex> out(g_out_mu);
             auto resp = orch.send_streaming(current_agent, line,
-                [](const std::string& chunk) { std::cout << chunk << std::flush; });
+                [&md](const std::string& chunk) {
+                    auto s = md.feed(chunk);
+                    if (!s.empty()) std::cout << s << std::flush;
+                });
+            auto tail = md.flush();
+            if (!tail.empty()) std::cout << tail;
             std::cout << "\n";
             if (resp.ok) {
                 tracker.record(current_agent, orch.get_agent_model(current_agent), resp);

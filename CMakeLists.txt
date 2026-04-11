@@ -38,6 +38,7 @@ set(CLAUDIUS_SOURCES
     src/commands.cpp
     src/readline_wrapper.cpp
     src/cost_tracker.cpp
+    src/markdown.cpp
 )
 
 add_executable(claudius ${CLAUDIUS_SOURCES})

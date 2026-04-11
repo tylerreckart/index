@@ -1,0 +1,31 @@
+#pragma once
+// claudius/include/markdown.h — Markdown-to-ANSI terminal renderer
+
+#include <string>
+
+namespace claudius {
+
+// Incremental renderer for streaming output.
+// Feed chunks as they arrive; complete styled lines are returned immediately.
+class MarkdownRenderer {
+public:
+    // Feed a streaming chunk. Returns any complete styled lines ready to print.
+    std::string feed(const std::string& chunk);
+
+    // Flush any partial final line. Call once after the stream ends.
+    std::string flush();
+
+    // Reset all state (call between independent responses if reusing).
+    void reset();
+
+private:
+    std::string line_buf_;
+    bool        in_code_block_ = false;
+
+    std::string process_line(const std::string& line);
+};
+
+// Render a complete markdown string to ANSI-styled output.
+std::string render_markdown(const std::string& text);
+
+} // namespace claudius
