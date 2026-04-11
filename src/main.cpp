@@ -40,7 +40,7 @@ static const char* BANNER =
     " | |    | |/ _` | | | |/ _` | | | | / __|\n"
     " | |____| | (_| | |_| | (_| | | |_| \\__ \\\n"
     "  \\_____|_|\\__,_|\\__,_|\\__,_|_|\\__,_|___/\n"
-    "                                    v0.1.3\n"
+    "                                    v0.1.4\n"
     "\033[0m";
 
 static std::string agent_color(const std::string& agent_id) {

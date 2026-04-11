@@ -99,7 +99,20 @@ std::string ApiClient::build_request_body(const ApiRequest& req, bool streaming)
     m["temperature"] = jnum(req.temperature);
 
     if (!req.system_prompt.empty()) {
-        m["system"] = jstr(req.system_prompt);
+        // Structured system block with prompt caching — cached tokens count at
+        // 1/10th toward input rate limits after the first request in a 5-min window.
+        auto cache_ctrl = jobj();
+        cache_ctrl->as_object_mut()["type"] = jstr("ephemeral");
+
+        auto sys_block = jobj();
+        auto& sb = sys_block->as_object_mut();
+        sb["type"]          = jstr("text");
+        sb["text"]          = jstr(req.system_prompt);
+        sb["cache_control"] = cache_ctrl;
+
+        auto sys_arr = jarr();
+        sys_arr->as_array_mut().push_back(sys_block);
+        m["system"] = sys_arr;
     }
 
     auto msgs = jarr();
@@ -125,6 +138,7 @@ std::string ApiClient::send_request(const std::string& body, bool streaming) {
     http << "Content-Type: application/json\r\n";
     http << "x-api-key: " << api_key_ << "\r\n";
     http << "anthropic-version: " << API_VERSION << "\r\n";
+    http << "anthropic-beta: prompt-caching-2024-07-31\r\n";
     http << "Content-Length: " << body.size() << "\r\n";
     if (streaming) http << "Accept: text/event-stream\r\n";
     http << "Connection: keep-alive\r\n";
@@ -239,8 +253,9 @@ ApiResponse ApiClient::parse_response(const std::string& body) {
         // Check for error
         auto err = root->get("error");
         if (err && err->is_object()) {
-            resp.ok = false;
-            resp.error = err->get_string("message", "Unknown API error");
+            resp.ok         = false;
+            resp.error_type = err->get_string("type");
+            resp.error      = err->get_string("message", "Unknown API error");
             return resp;
         }
 
@@ -256,49 +271,87 @@ ApiResponse ApiClient::parse_response(const std::string& body) {
 
         resp.stop_reason = root->get_string("stop_reason");
 
-        // Token usage
+        // Token usage — including prompt cache fields
         auto usage = root->get("usage");
         if (usage && usage->is_object()) {
-            resp.input_tokens  = usage->get_int("input_tokens");
-            resp.output_tokens = usage->get_int("output_tokens");
+            resp.input_tokens          = usage->get_int("input_tokens");
+            resp.output_tokens         = usage->get_int("output_tokens");
+            resp.cache_read_tokens     = usage->get_int("cache_read_input_tokens");
+            resp.cache_creation_tokens = usage->get_int("cache_creation_input_tokens");
         }
 
         resp.ok = true;
     } catch (const std::exception& e) {
-        resp.ok = false;
+        resp.ok    = false;
         resp.error = std::string("Parse error: ") + e.what();
     }
 
     return resp;
 }
 
+// Retryable error types — rate limit and transient overload.
+static bool is_retryable(const std::string& error_type) {
+    return error_type == "rate_limit_error" || error_type == "overloaded_error";
+}
+
 ApiResponse ApiClient::complete(const ApiRequest& req) {
-    std::lock_guard<std::mutex> lock(conn_mutex_);
+    static const int kMaxAttempts = 4;
 
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        try {
-            if (!ensure_connection()) {
-                return ApiResponse{false, "", 0, 0, "Connection failed"};
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (attempt > 0) {
+            // Exponential backoff outside the mutex: 1s, 2s, 4s
+            usleep((1 << (attempt - 1)) * 1000000);
+        }
+
+        ApiResponse resp;
+        bool threw = false;
+
+        {
+            std::lock_guard<std::mutex> lock(conn_mutex_);
+            try {
+                if (!ensure_connection()) {
+                    ApiResponse r;
+                    r.ok    = false;
+                    r.error = "Connection failed";
+                    return r;
+                }
+                std::string body = build_request_body(req, false);
+                send_request(body, false);
+                std::string raw = read_response(false, nullptr);
+                resp = parse_response(raw);
+            } catch (...) {
+                close_connection();
+                threw = true;
             }
+        }
 
-            std::string body = build_request_body(req, false);
-            send_request(body, false);
-            std::string raw = read_response(false, nullptr);
+        if (threw) {
+            if (attempt >= kMaxAttempts - 1) {
+                ApiResponse r;
+                r.ok    = false;
+                r.error = "Request failed after retries";
+                return r;
+            }
+            continue;
+        }
 
-            auto resp = parse_response(raw);
+        if (resp.ok) {
             total_in_  += resp.input_tokens;
             total_out_ += resp.output_tokens;
             return resp;
-
-        } catch (...) {
-            close_connection();
-            if (attempt == 1) {
-                return ApiResponse{false, "", 0, 0, "Request failed after retry"};
-            }
         }
+
+        // Non-retryable error — return immediately
+        if (!is_retryable(resp.error_type) || attempt >= kMaxAttempts - 1) {
+            return resp;
+        }
+        // Otherwise loop with backoff
     }
 
-    return ApiResponse{false, "", 0, 0, "Unreachable"};
+    ApiResponse r;
+    r.ok    = false;
+    r.error = "Unreachable";
+    return r;
 }
 
 ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
@@ -306,7 +359,10 @@ ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
 
     try {
         if (!ensure_connection()) {
-            return ApiResponse{false, "", 0, 0, "Connection failed"};
+            ApiResponse r;
+            r.ok    = false;
+            r.error = "Connection failed";
+            return r;
         }
 
         std::string body = build_request_body(req, true);
@@ -314,25 +370,18 @@ ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
         std::string raw = read_response(true, cb);
 
         // For streaming, parse the accumulated SSE data to get final usage
-        // Find the last message_stop or message_delta with usage
         ApiResponse resp;
-        resp.ok = true;
+        resp.ok       = true;
         resp.raw_body = raw;
 
-        // Extract accumulated text from SSE events
         std::istringstream stream_data(raw);
         std::string line;
         while (std::getline(stream_data, line)) {
             if (line.find("\"type\":\"message_delta\"") != std::string::npos) {
                 try {
-                    // Find the JSON object in this SSE event
-                    auto pos = line.find("{");
-                    if (pos != std::string::npos) {
-                        // Try to find usage in the delta
-                        auto upos = line.find("\"output_tokens\":");
-                        if (upos != std::string::npos) {
-                            resp.output_tokens = std::atoi(line.c_str() + upos + 16);
-                        }
+                    auto upos = line.find("\"output_tokens\":");
+                    if (upos != std::string::npos) {
+                        resp.output_tokens = std::atoi(line.c_str() + upos + 16);
                     }
                 } catch (...) {}
             }
@@ -344,7 +393,10 @@ ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
 
     } catch (const std::exception& e) {
         close_connection();
-        return ApiResponse{false, "", 0, 0, std::string("Stream error: ") + e.what()};
+        ApiResponse r;
+        r.ok    = false;
+        r.error = std::string("Stream error: ") + e.what();
+        return r;
     }
 }
 

@@ -33,9 +33,9 @@ ApiResponse Agent::send(const std::string& user_message) {
         stats_.total_requests++;
     }
 
-    // Auto-trim if history grows large
-    if (history_.size() > 40) {
-        trim_history(20);
+    // Auto-trim if history grows large — keep window tight to stay under rate limits
+    if (history_.size() > 20) {
+        trim_history(10);
     }
 
     return resp;

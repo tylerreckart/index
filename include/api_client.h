@@ -29,11 +29,14 @@ struct ApiRequest {
 
 struct ApiResponse {
     bool ok = false;
-    std::string content;        // extracted text
+    std::string content;             // extracted text
     int input_tokens = 0;
     int output_tokens = 0;
+    int cache_read_tokens = 0;       // prompt cache hits (count 1/10 toward rate limit)
+    int cache_creation_tokens = 0;   // tokens written into cache this request
     std::string error;
-    std::string raw_body;       // full response for debug
+    std::string error_type;          // e.g. "rate_limit_error", "overloaded_error"
+    std::string raw_body;            // full response for debug
     std::string stop_reason;
 };
 
