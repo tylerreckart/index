@@ -518,29 +518,56 @@ stream_done:
 }
 
 ApiResponse ApiClient::stream(const ApiRequest& req, StreamCallback cb) {
-    std::lock_guard<std::mutex> lock(conn_mutex_);
-    try {
-        if (!ensure_connection()) {
-            ApiResponse r;
-            r.ok    = false;
-            r.error = last_conn_error_.empty() ? "Connection failed" : last_conn_error_;
-            return r;
+    static const int kMaxAttempts = 3;
+
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (attempt > 0) {
+            // Brief backoff between retries (only safe if no content was sent yet).
+            usleep((1 << (attempt - 1)) * 1000000);
         }
-        std::string body = build_request_body(req, true);
-        send_request(body, true, !req.advisor_model.empty());
-        ApiResponse resp = read_streaming_response(cb);
+
+        ApiResponse resp;
+        bool threw = false;
+
+        {
+            std::lock_guard<std::mutex> lock(conn_mutex_);
+            try {
+                if (!ensure_connection()) {
+                    resp.ok    = false;
+                    resp.error = last_conn_error_.empty() ? "Connection failed" : last_conn_error_;
+                } else {
+                    std::string body = build_request_body(req, true);
+                    send_request(body, true, !req.advisor_model.empty());
+                    resp = read_streaming_response(cb);
+                }
+            } catch (const std::exception& e) {
+                close_connection();
+                threw = true;
+                resp.ok    = false;
+                resp.error = std::string("Stream error: ") + e.what();
+            }
+        }
+
         if (resp.ok) {
             total_in_  += resp.input_tokens;
             total_out_ += resp.output_tokens;
+            return resp;
         }
-        return resp;
-    } catch (const std::exception& e) {
-        close_connection();
-        ApiResponse r;
-        r.ok    = false;
-        r.error = std::string("Stream error: ") + e.what();
-        return r;
+
+        // Only retry if no content reached the caller (avoids duplicate output).
+        bool can_retry = resp.content.empty() &&
+                         (threw || is_retryable(resp.error_type));
+        if (!can_retry || attempt >= kMaxAttempts - 1) {
+            return resp;
+        }
+
+        close_connection();  // force fresh connection on retry
     }
+
+    ApiResponse r;
+    r.ok    = false;
+    r.error = "Stream failed after retries";
+    return r;
 }
 
 } // namespace claudius

@@ -37,6 +37,20 @@ public:
     // Max history entries kept in memory and file.
     void set_max_history(int n);
 
+    // Tell readline the cursor is now on a fresh line and redraw the prompt.
+    // Only safe to call from the readline thread (main thread).
+    void redisplay();
+
+    // Non-blocking readline: install handler, draw prompt, return immediately.
+    void install_callback(const std::string& prompt,
+                          std::function<void(const std::string&)> on_line);
+
+    // Process one character from stdin (call when stdin is ready).
+    void process_char();
+
+    // Remove the installed callback handler.
+    void remove_callback();
+
 private:
     std::string history_path_;
     int         max_history_ = 1000;

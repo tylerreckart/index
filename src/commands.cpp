@@ -279,6 +279,17 @@ std::string cmd_write(const std::string& path, const std::string& content) {
         if (ec) return "ERR: cannot create directories: " + ec.message();
     }
 
+    // Back up existing file before overwriting.
+    bool overwrite = false;
+    std::string bak_note;
+    if (fs::exists(p)) {
+        overwrite = true;
+        std::string bak = path + ".bak";
+        std::error_code ec;
+        fs::copy_file(p, bak, fs::copy_options::overwrite_existing, ec);
+        if (!ec) bak_note = " (previous saved to " + bak + ")";
+    }
+
     std::ofstream f(path, std::ios::out | std::ios::trunc);
     if (!f.is_open()) return "ERR: cannot open for writing: " + path;
 
@@ -287,7 +298,9 @@ std::string cmd_write(const std::string& path, const std::string& content) {
 
     if (f.fail()) return "ERR: write failed: " + path;
 
-    return "OK: wrote " + std::to_string(content.size()) + " bytes to " + path;
+    std::string action = overwrite ? "overwrote" : "wrote";
+    return "OK: " + action + " " + std::to_string(content.size())
+           + " bytes to " + path + bak_note;
 }
 
 // ---------------------------------------------------------------------------

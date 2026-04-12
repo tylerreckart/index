@@ -29,6 +29,9 @@ public:
     // Clear conversation history (keep constitution)
     void reset_history();
 
+    // Replace history (used for session restore)
+    void set_history(std::vector<Message> h) { history_ = std::move(h); }
+
     // Truncate history to keep token usage bounded
     void trim_history(int keep_last_n = 10);
 

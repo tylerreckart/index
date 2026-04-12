@@ -3,6 +3,7 @@
 #include "commands.h"
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -110,6 +111,14 @@ void Orchestrator::set_progress_callback(ProgressCallback cb) {
     progress_cb_ = std::move(cb);
 }
 
+void Orchestrator::set_cost_callback(CostCallback cb) {
+    cost_cb_ = std::move(cb);
+}
+
+void Orchestrator::set_agent_start_callback(AgentStartCallback cb) {
+    start_cb_ = std::move(cb);
+}
+
 // Core agentic dispatch loop — used by both send() and sub-agent invocations.
 ApiResponse Orchestrator::send_internal(const std::string& agent_id,
                                         const std::string& message,
@@ -130,13 +139,17 @@ ApiResponse Orchestrator::send_internal(const std::string& agent_id,
     ApiResponse resp;
     static constexpr int kMaxTurns = 6;
     for (int i = 0; i < kMaxTurns; ++i) {
+        // Notify UI that a sub-agent is about to make an API call.
+        if (depth > 0 && start_cb_) start_cb_(agent_id);
+
         resp = agent_ptr->send(current_msg);
         if (!resp.ok) return resp;
 
-        // Notify the UI about sub-agent turns (depth > 0) so the user can
-        // watch orchestration unfold in real time.
-        if (depth > 0 && resp.ok && progress_cb_) {
-            progress_cb_(agent_id, resp.content);
+        if (depth > 0 && resp.ok) {
+            // Notify the UI (progress) and record cost for sub-agent turns.
+            // Top-level cost is recorded by the REPL after send() returns.
+            if (progress_cb_) progress_cb_(agent_id, resp.content);
+            if (cost_cb_)     cost_cb_(agent_id, agent_ptr->config().model, resp);
         }
 
         auto cmds = parse_agent_commands(resp.content);
@@ -234,6 +247,86 @@ std::string Orchestrator::global_status() const {
        << " out:" << client_.total_output_tokens() << "\n";
 
     return ss.str();
+}
+
+// ─── Session persistence ──────────────────────────────────────────────────────
+
+static std::shared_ptr<JsonValue> messages_to_json(const std::vector<Message>& msgs) {
+    auto arr = jarr();
+    for (auto& m : msgs) {
+        auto obj = jobj();
+        obj->as_object_mut()["role"]    = jstr(m.role);
+        obj->as_object_mut()["content"] = jstr(m.content);
+        arr->as_array_mut().push_back(obj);
+    }
+    return arr;
+}
+
+static std::vector<Message> messages_from_json(const JsonValue* arr) {
+    std::vector<Message> out;
+    if (!arr || !arr->is_array()) return out;
+    for (auto& v : arr->as_array()) {
+        if (!v) continue;
+        out.push_back({v->get_string("role"), v->get_string("content")});
+    }
+    return out;
+}
+
+void Orchestrator::save_session(const std::string& path) const {
+    auto root = jobj();
+    auto& m = root->as_object_mut();
+    m["version"] = jnum(1);
+
+    // Claudius master history
+    m["claudius"] = messages_to_json(claudius_master_->history());
+
+    // All loaded agents
+    auto agents_obj = jobj();
+    {
+        std::lock_guard<std::mutex> lk(agents_mutex_);
+        for (auto& [id, agent] : agents_) {
+            if (!agent->history().empty())
+                agents_obj->as_object_mut()[id] = messages_to_json(agent->history());
+        }
+    }
+    m["agents"] = agents_obj;
+
+    std::ofstream f(path);
+    if (f.is_open()) f << json_serialize(*root);
+}
+
+bool Orchestrator::load_session(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string raw = ss.str();
+    if (raw.empty()) return false;
+
+    try {
+        auto root = json_parse(raw);
+
+        // Restore claudius master
+        auto cval = root->get("claudius");
+        auto cmsgs = messages_from_json(cval.get());
+        if (!cmsgs.empty()) claudius_master_->set_history(std::move(cmsgs));
+
+        // Restore loaded agents
+        auto aval = root->get("agents");
+        if (aval && aval->is_object()) {
+            std::lock_guard<std::mutex> lk(agents_mutex_);
+            for (auto& [id, vptr] : aval->as_object()) {
+                auto it = agents_.find(id);
+                if (it == agents_.end()) continue;
+                auto msgs = messages_from_json(vptr.get());
+                if (!msgs.empty()) it->second->set_history(std::move(msgs));
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace claudius

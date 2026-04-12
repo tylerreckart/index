@@ -26,6 +26,19 @@ public:
                                                  const std::string& content)>;
     void set_progress_callback(ProgressCallback cb);
 
+    // Optional callback fired after every completed agent turn at any depth.
+    // Use this to record sub-agent token costs that would otherwise be invisible
+    // to a CostTracker wired only to the top-level REPL response handler.
+    using CostCallback = std::function<void(const std::string& agent_id,
+                                             const std::string& model,
+                                             const ApiResponse& resp)>;
+    void set_cost_callback(CostCallback cb);
+
+    // Fired at the start of each sub-agent turn (before the API call).
+    // Use to show a "working..." indicator in the UI.
+    using AgentStartCallback = std::function<void(const std::string& agent_id)>;
+    void set_agent_start_callback(AgentStartCallback cb);
+
     // Agent management
     Agent& create_agent(const std::string& id, Constitution config);
     Agent& get_agent(const std::string& id);
@@ -57,6 +70,12 @@ public:
     // Global stats
     std::string global_status() const;
 
+    // Session persistence — save/restore all agent conversation histories.
+    // Histories are stored as JSON at the given path; agent configs come from
+    // the normal .json files and are not duplicated in the session file.
+    void save_session(const std::string& path) const;
+    bool load_session(const std::string& path);  // returns true if anything loaded
+
     // Token tracking
     int total_input_tokens()  const { return client_.total_input_tokens(); }
     int total_output_tokens() const { return client_.total_output_tokens(); }
@@ -68,7 +87,9 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Agent>> agents_;
     mutable std::mutex agents_mutex_;
     std::string memory_dir_;
-    ProgressCallback progress_cb_;
+    ProgressCallback   progress_cb_;
+    CostCallback       cost_cb_;
+    AgentStartCallback start_cb_;
 
     // Master Claudius agent for meta-queries
     std::unique_ptr<Agent> claudius_master_;

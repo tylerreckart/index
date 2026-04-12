@@ -22,6 +22,7 @@ namespace claudius {
 
 #ifdef CLAUDIUS_HAS_READLINE
 static CompletionProvider g_provider;
+static std::function<void(const std::string&)> g_line_callback;
 
 static char* completion_generator(const char* text, int state) {
     static std::vector<std::string> matches;
@@ -45,6 +46,18 @@ static char** completion_callback(const char* text, int /*start*/, int /*end*/) 
     rl_attempted_completion_over = 1;  // suppress filename fallback
     if (!g_provider) return nullptr;
     return rl_completion_matches(text, completion_generator);
+}
+
+static void rl_line_handler(char* raw) {
+    if (!raw) {
+        // EOF / Ctrl-D
+        if (g_line_callback) g_line_callback("");
+        return;
+    }
+    std::string line(raw);
+    if (!line.empty()) ::add_history(raw);
+    ::free(raw);
+    if (g_line_callback) g_line_callback(line);
 }
 #endif
 
@@ -106,6 +119,37 @@ void ReadlineWrapper::set_max_history(int n) {
     max_history_ = n;
 #ifdef CLAUDIUS_HAS_READLINE
     ::stifle_history(n);
+#endif
+}
+
+void ReadlineWrapper::redisplay() {
+#ifdef CLAUDIUS_HAS_READLINE
+    ::rl_on_new_line();
+    ::rl_redisplay();
+#endif
+}
+
+void ReadlineWrapper::install_callback(const std::string& prompt,
+                                        std::function<void(const std::string&)> on_line) {
+#ifdef CLAUDIUS_HAS_READLINE
+    g_line_callback = std::move(on_line);
+    ::rl_callback_handler_install(prompt.c_str(), rl_line_handler);
+#else
+    (void)prompt;
+    (void)on_line;
+#endif
+}
+
+void ReadlineWrapper::process_char() {
+#ifdef CLAUDIUS_HAS_READLINE
+    ::rl_callback_read_char();
+#endif
+}
+
+void ReadlineWrapper::remove_callback() {
+#ifdef CLAUDIUS_HAS_READLINE
+    ::rl_callback_handler_remove();
+    g_line_callback = nullptr;
 #endif
 }
 
