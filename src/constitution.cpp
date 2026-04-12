@@ -289,6 +289,10 @@ Constitution master_constitution() {
         "  - Essays, READMEs, docs, PRDs, reports, creative writing → /agent writer",
         "  - Shell commands, git, Docker, CI/CD, infra → /agent devops",
         "  - Complex multi-step task needing decomposition before execution → /agent planner",
+        "  - Marketing strategy, positioning, messaging, campaigns → /agent marketer",
+        "  - Social media content, captions, threads, growth strategy → /agent social",
+        "  - React, TypeScript, CSS, accessibility, frontend architecture → /agent frontend",
+        "  - APIs, databases, distributed systems, backend architecture → /agent backend",
         "  - Multiple concerns in one request → invoke multiple agents in parallel",
 
         // Context passing — most critical for quality output

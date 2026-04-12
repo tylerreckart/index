@@ -258,6 +258,8 @@ static void cmd_init() {
     std::cout << "  devops.json     — infrastructure (full)\n";
     std::cout << "  writer.json     — essays, docs, READMEs, creative writing\n";
     std::cout << "  planner.json    — task decomposition, phased execution plans\n\n";
+    std::cout << "Additional agents are available in the repo under agents/.\n";
+    std::cout << "Copy any you want to ~/.claudius/agents/ and restart.\n\n";
     std::cout << "Edit these or add your own. Then run: claudius\n";
 }
 
@@ -353,11 +355,13 @@ public:
     static constexpr int kStatusRows = 1;  // row N   (status bar)
 
     // Enter alternate screen, set scroll region, draw chrome.
-    void init(const std::string& agent, const std::string& model) {
+    void init(const std::string& agent, const std::string& model,
+              const std::string& color = "") {
         (void)model;
         cols_ = term_cols();
         rows_ = term_rows();
         current_agent_ = agent;
+        current_color_  = color;
 
         printf("\033[?1049h");   // enter alternate screen
         printf("\033[2J");       // clear
@@ -391,9 +395,10 @@ public:
 
     // Redraw header. stats_str comes from CostTracker::format_session_stats().
     void update(const std::string& agent, const std::string& /*model*/,
-                const std::string& stats) {
+                const std::string& stats, const std::string& color = "") {
         current_agent_ = agent;
         current_stats_ = stats;
+        if (!color.empty()) current_color_ = color;
         draw_header();
     }
 
@@ -472,6 +477,7 @@ private:
     std::atomic<bool> queue_indicator_shown_{false};
     std::string current_agent_ = "claudius";
     std::string current_stats_;   // from format_session_stats()
+    std::string current_color_;   // ANSI color for current agent name
     std::string session_title_;   // generated after first response
     mutable std::mutex header_mu_;
 
@@ -514,11 +520,12 @@ private:
         // Row 1 — blank
         printf("\033[1;1H\033[2K");
 
-        // Row 2 — agent (bold) + optional title (normal/dim) + stats (dim)
+        // Row 2 — agent name (bold, agent color) + optional title (dim) + stats (dim)
         printf("\033[2;1H\033[2K");
-        printf("\033[1m  %s\033[22m", current_agent_.c_str());
+        if (!current_color_.empty()) printf("%s", current_color_.c_str());
+        printf("\033[1m  %s\033[0m", current_agent_.c_str());
         if (!session_title_.empty())
-            printf("\033[2m   %s\033[22m", session_title_.c_str());
+            printf("\033[2m   %s\033[0m", session_title_.c_str());
         printf("  ");
         printf("%*s", pad, "");
         if (!right_vis.empty())
@@ -1112,7 +1119,7 @@ static void cmd_interactive() {
 
     // Init TUI before any output (clears screen, sets scroll region, draws header).
     TUI tui;
-    tui.init(current_agent, current_model);
+    tui.init(current_agent, current_model, agent_color(current_agent));
 
     // Restore previous session if one exists.
     std::string session_path = dir + "/session.json";
@@ -1271,7 +1278,7 @@ static void cmd_interactive() {
                 if (id == "claudius" || orch.has_agent(id)) {
                     current_agent = id;
                     current_model = orch.get_agent_model(id);
-                    tui.update(current_agent, current_model, tracker.format_session_stats());
+                    tui.update(current_agent, current_model, tracker.format_session_stats(), agent_color(current_agent));
                 } else {
                     output_queue.push("ERR: no agent '" + id + "'\n");
                 }
@@ -1295,7 +1302,7 @@ static void cmd_interactive() {
                     output_queue.push("\n");
                     if (resp.ok) {
                         tracker.record(id, orch.get_agent_model(id), resp);
-                        tui.update(current_agent, current_model, tracker.format_session_stats());
+                        tui.update(current_agent, current_model, tracker.format_session_stats(), agent_color(current_agent));
                         maybe_generate_title(msg, resp.content);
                     } else {
                         output_queue.push("\033[38;5;167mERR: " + resp.error + "\033[0m\n");
@@ -1321,7 +1328,7 @@ static void cmd_interactive() {
                     output_queue.push("\n");
                     if (resp.ok) {
                         tracker.record("claudius", orch.get_agent_model("claudius"), resp);
-                        tui.update(current_agent, current_model, tracker.format_session_stats());
+                        tui.update(current_agent, current_model, tracker.format_session_stats(), agent_color(current_agent));
                         maybe_generate_title(query, resp.content);
                     } else {
                         output_queue.push("\033[38;5;167mERR: " + resp.error + "\033[0m\n");
@@ -1505,7 +1512,7 @@ static void cmd_interactive() {
                     if (resp.ok) {
                         output_queue.push(claudius::render_markdown(resp.content) + "\n");
                         tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
-                        tui.update(current_agent, current_model, tracker.format_session_stats());
+                        tui.update(current_agent, current_model, tracker.format_session_stats(), agent_color(current_agent));
                     } else {
                         output_queue.push("\033[38;5;167mERR: " + resp.error + "\033[0m\n");
                     }
@@ -1544,7 +1551,7 @@ static void cmd_interactive() {
                         if (resp.ok) {
                             output_queue.push(claudius::render_markdown(resp.content) + "\n");
                             tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
-                            tui.update(current_agent, current_model, tracker.format_session_stats());
+                            tui.update(current_agent, current_model, tracker.format_session_stats(), agent_color(current_agent));
                         } else {
                             output_queue.push("ERR: " + resp.error + "\n");
                         }
@@ -1635,7 +1642,7 @@ static void cmd_interactive() {
             output_queue.push("\n");
             if (resp.ok) {
                 tracker.record(current_agent, orch.get_agent_model(current_agent), resp);
-                tui.update(current_agent, current_model, tracker.format_session_stats());
+                tui.update(current_agent, current_model, tracker.format_session_stats(), agent_color(current_agent));
                 maybe_generate_title(line, resp.content);
             } else {
                 output_queue.push("\033[38;5;167mERR: " + resp.error + "\033[0m\n");
@@ -1724,6 +1731,29 @@ static void cmd_interactive() {
                 break;
             }
             exit_warned = false;
+        }
+
+        // Echo the user's prompt into the scroll region so it persists in the
+        // session view rather than disappearing when enter is pressed.
+        // Styled with a muted arrow prefix to distinguish it from model output.
+        {
+            // Drain any output that arrived while readline was active so the
+            // echo lands after previous command output, not mid-stream.
+            std::string pending = output_queue.drain();
+            if (!pending.empty()) {
+                printf("\0337");
+                printf("\033[%d;1H", tui.last_scroll_row());
+                fwrite(pending.data(), 1, pending.size(), stdout);
+                printf("\0338");
+                fflush(stdout);
+            }
+
+            std::string echo = "\033[38;5;244m> \033[38;5;250m" + line + "\033[0m\n\n";
+            printf("\0337");
+            printf("\033[%d;1H", tui.last_scroll_row());
+            fwrite(echo.data(), 1, echo.size(), stdout);
+            printf("\0338");
+            fflush(stdout);
         }
 
         bool was_busy = cmd_queue.is_busy();
