@@ -1,7 +1,7 @@
 <h1 align="center">Claudius</h1>
 
 <p align="center">
-  <strong>**A lightweight, general-purpose agent orchestration runtime for the Claude API.**</strong>
+  <strong>A lightweight, general-purpose agent orchestration runtime for the Claude API.</strong>
 </p>
 
 <p align="center">
@@ -12,7 +12,6 @@
 
 - Talks to Claude over raw TLS (no libcurl, no HTTP library)
 - Enforces a constitution — formal, terse, token-efficient (derived from [JuliusBrussee/caveman](https://github.com/JuliusBrussee/caveman))
-  — Cuts ~75% of output tokens based on brevity
 - Supports per-agent constitutions with personality, goals, rules, and brevity levels: `lite`, `full`, `ultra`
 - Agents can invoke `/fetch` and `/mem` commands autonomously — the orchestrator executes them and feeds results back in an agentic dispatch loop
 - Runs as an interactive REPL, a TCP server for remote access, or a one-shot CLI
