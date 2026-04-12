@@ -41,7 +41,7 @@ namespace fs = std::filesystem;
 static const char* BANNER =
     "\n"
     "————————————————————————————————\n"
-    "| Claudius              v0.2.0 |\n"
+    "| Claudius              v0.2.1 |\n"
     "————————————————————————————————\n"
     "\033[38;5;208m"
     "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbc\n"
@@ -341,10 +341,13 @@ static int term_rows() {
 
 class TUI {
 public:
-    // Layout constants (rows reserved at top/bottom, outside the scroll region).
+    // Layout constants.
+    // kInputRows is 0 — the input lives at the natural bottom of the scroll
+    // region rather than a fixed row, avoiding cursor-ownership conflicts between
+    // the readline thread and the exec thread.
     static constexpr int kHeaderRows = 3;  // blank + title + blank
-    static constexpr int kInputRows  = 1;  // pinned input bar
-    static constexpr int kStatusRows = 1;  // spinner / status bar
+    static constexpr int kInputRows  = 0;  // no dedicated input row
+    static constexpr int kStatusRows = 1;  // status bar (anchored via save/restore)
 
     // Enter alternate screen, set scroll region, draw chrome.
     void init(const std::string& agent, const std::string& model) {
@@ -354,12 +357,11 @@ public:
         current_agent_ = agent;
 
         printf("\033[?1049h");   // enter alternate screen
-        printf("\033[2J");       // clear (no bg fill — avoids cursor/scroll misalignment)
+        printf("\033[2J");       // clear
         set_scroll_region();
-        printf("\033[%d;1H", kHeaderRows + 1);  // park in scroll region
+        printf("\033[%d;1H", kHeaderRows + 1);  // park cursor at top of scroll region
         fflush(stdout);
         draw_header();
-        erase_chrome_row(input_row());
         erase_chrome_row(status_row());
     }
 
@@ -369,7 +371,6 @@ public:
         printf("\033[2J");
         set_scroll_region();
         draw_header();
-        erase_chrome_row(input_row());
         erase_chrome_row(status_row());
         fflush(stdout);
     }
@@ -387,19 +388,24 @@ public:
         draw_header();
     }
 
-    // Position cursor at the pinned input bar so readline reads from there.
-    // Does NOT save/restore — leaves cursor at input row for readline.
-    void begin_input() {
-        erase_chrome_row(input_row());
-        printf("\033[%d;3H", input_row());  // col 3 = 2-space left indent
+    // Called before readline reads the next line.
+    // Ensures the cursor is on a fresh line inside the scroll region so the
+    // readline prompt is always visible and stable.
+    void begin_input(int queued = 0) {
+        // Move to the last scroll row and emit a blank line so the prompt
+        // always appears on its own line regardless of where output ended.
+        printf("\033[%d;1H\n", rows_ - kStatusRows);
         fflush(stdout);
+        if (queued > 0) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%d queued", queued);
+            set_status(buf);
+        }
     }
 
-    // After readline returns, move cursor back into the scroll region so
-    // response output scrolls correctly.
+    // Called before output to ensure the cursor is inside the scroll region.
     void begin_output() {
-        int last_scroll = rows_ - kInputRows - kStatusRows;
-        printf("\033[%d;1H", last_scroll);
+        printf("\033[%d;1H", rows_ - kStatusRows);
         fflush(stdout);
     }
 
@@ -422,18 +428,27 @@ public:
 
     int cols() const { return cols_; }
 
+    // Update the session title shown next to the agent name in the header.
+    // Thread-safe — called from the title-generation background thread.
+    void set_title(const std::string& title) {
+        std::lock_guard<std::mutex> lk(header_mu_);
+        session_title_ = title;
+        draw_header_locked();
+    }
+
 private:
     int  cols_ = 80, rows_ = 24;
     bool status_active_ = false;
     std::string current_agent_ = "claudius";
     std::string current_stats_;   // from format_session_stats()
+    std::string session_title_;   // generated after first response
+    mutable std::mutex header_mu_;
 
-    int input_row()  const { return rows_ - kStatusRows; }
     int status_row() const { return rows_; }
 
     void set_scroll_region() {
         int top = kHeaderRows + 1;
-        int bot = rows_ - kInputRows - kStatusRows;
+        int bot = rows_ - kStatusRows;  // scroll region ends just above status bar
         printf("\033[%d;%dr", top, bot);
     }
 
@@ -446,30 +461,40 @@ private:
     }
 
     void draw_header() {
-        // Three rows: blank / content / blank.
-        // Content row: "  agent  " (bold) ... "stats   " (muted grey)
-        std::string left_vis  = "  " + current_agent_ + "  ";
+        std::lock_guard<std::mutex> lk(header_mu_);
+        draw_header_locked();
+    }
+
+    // Must be called with header_mu_ held.
+    void draw_header_locked() {
+        // Left side: "  agent  " or "  agent  ·  title  "
+        std::string left_vis = "  " + current_agent_;
+        if (!session_title_.empty())
+            left_vis += "   " + session_title_;
+        left_vis += "  ";
+
         std::string right_vis = current_stats_.empty() ? "" : current_stats_ + "   ";
         int pad = std::max(0, cols_ - (int)left_vis.size() - (int)right_vis.size());
 
         printf("\0337");
 
-        // Row 1 — blank padding
-        printf("\033[1;1H\033[48;5;233m%*s", cols_, "");
+        // Row 1 — blank
+        printf("\033[1;1H\033[2K");
 
-        // Row 2 — title + stats
-        printf("\033[2;1H\033[48;5;233m");
-        // Bold light-grey agent name
-        printf("\033[1m\033[38;5;253m  %s  \033[0m\033[48;5;233m",
-               current_agent_.c_str());
-        // Fill gap
+        // Row 2 — agent (bold) + optional title (normal/dim) + stats (dim)
+        printf("\033[2;1H\033[2K");
+        printf("\033[1m  %s\033[22m", current_agent_.c_str());
+        if (!session_title_.empty())
+            printf("\033[2m   %s\033[22m", session_title_.c_str());
+        printf("  ");
         printf("%*s", pad, "");
-        // Muted grey stats (no colour coding)
         if (!right_vis.empty())
-            printf("\033[38;5;242m%s\033[0m", right_vis.c_str());
+            printf("\033[2m%s\033[0m", right_vis.c_str());
 
-        // Row 3 — blank padding
-        printf("\033[3;1H\033[48;5;233m%*s\033[0m", cols_, "");
+        // Row 3 — dim separator
+        printf("\033[3;1H\033[2K\033[38;5;237m");
+        for (int i = 0; i < cols_; ++i) printf("─");
+        printf("\033[0m");
 
         printf("\0338");
         fflush(stdout);
@@ -511,6 +536,53 @@ static void print_turn_rule(const std::string& label, const std::string& color,
     std::cout << line;
 }
 
+// ─── Title generation ────────────────────────────────────────────────────────
+
+// Fires a cheap Haiku call to produce a 5-7 word session title, then updates
+// the TUI header. Runs detached — does not block the caller.
+static void generate_title_async(claudius::ApiClient& client,
+                                  const std::string& user_msg,
+                                  const std::string& assistant_snippet,
+                                  TUI& tui) {
+    std::thread([&client, user_msg, assistant_snippet, &tui]() {
+        claudius::ApiRequest req;
+        req.model       = "claude-haiku-4-5-20251001";
+        req.max_tokens  = 12;
+        req.temperature = 0.3;
+        // No system_prompt — putting all instructions inline in the user turn
+        // avoids the model echoing the system prompt as its response.
+
+        std::string ctx = user_msg.substr(0, 200);
+        if (!assistant_snippet.empty())
+            ctx += "\n\n" + assistant_snippet.substr(0, 150);
+
+        // "Title:" at the end cues completion behavior rather than a reply.
+        req.messages = {{
+            "user",
+            "Conversation excerpt:\n" + ctx +
+            "\n\nWrite a 5-7 word task title for this conversation. "
+            "Reply with the title words only — no punctuation, no quotes.\n\nTitle:"
+        }};
+
+        auto resp = client.complete(req);
+        if (!resp.ok || resp.content.empty()) return;
+
+        std::string title = resp.content;
+        // Strip whitespace, punctuation, and any leading/trailing newlines.
+        while (!title.empty() && (title.back() == '\n' || title.back() == '\r' ||
+                                   title.back() == ' '  || title.back() == '.'))
+            title.pop_back();
+        while (!title.empty() && (title.front() == '\n' || title.front() == ' '))
+            title.erase(title.begin());
+        // Remove surrounding quotes if the model added them anyway.
+        if (title.size() >= 2 && title.front() == '"' && title.back() == '"')
+            title = title.substr(1, title.size() - 2);
+
+        if (!title.empty())
+            tui.set_title(title);
+    }).detach();
+}
+
 // ─── Thinking indicator ───────────────────────────────────────────────────────
 
 class ThinkingIndicator {
@@ -547,6 +619,51 @@ private:
 // Shared output lock: prevents loop thread output from interleaving with
 // interactive responses printed by the main thread.
 static std::mutex g_out_mu;
+
+// ─── Command queue ────────────────────────────────────────────────────────────
+// Decouples the readline loop from command execution so the user can type
+// the next command while the current one is still running.
+
+class CommandQueue {
+public:
+    void push(std::string cmd) {
+        std::lock_guard<std::mutex> lk(mu_);
+        items_.push(std::move(cmd));
+        cv_.notify_one();
+    }
+
+    // Blocks until an item is available or the queue is stopped.
+    // Returns false when stopped and empty.
+    bool pop(std::string& out) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this]{ return !items_.empty() || stopped_; });
+        if (items_.empty()) return false;
+        out = std::move(items_.front());
+        items_.pop();
+        return true;
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> lk(mu_);
+        stopped_ = true;
+        cv_.notify_all();
+    }
+
+    // Depth = queued items + 1 if currently executing.
+    int depth() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return static_cast<int>(items_.size()) + (busy_ ? 1 : 0);
+    }
+
+    void set_busy(bool b) { busy_ = b; }
+
+private:
+    mutable std::mutex      mu_;
+    std::condition_variable cv_;
+    std::queue<std::string> items_;
+    bool                    stopped_ = false;
+    std::atomic<bool>       busy_{false};
+};
 
 // ─── Agent loop machinery ────────────────────────────────────────────────────
 
@@ -979,7 +1096,6 @@ static void cmd_interactive() {
     LoopManager loops;
     claudius::ReadlineWrapper rl;
     claudius::CostTracker tracker;
-    bool exit_warned = false;
 
     rl.set_max_history(1000);
     rl.load_history(get_config_dir() + "/history");
@@ -1034,43 +1150,21 @@ static void cmd_interactive() {
             return {};
         });
 
-    while (true) {
-        // Handle terminal resize between inputs
-        if (g_winch) { g_winch = 0; tui.resize(); }
+    // ── Command queue + execution thread ────────────────────────────────────────
+    CommandQueue cmd_queue;
+    std::atomic<bool> quit_requested{false};
+    std::atomic<bool> title_generated{false};  // generate title only once per session
 
-        tui.begin_input();
-        std::string prompt = "\033[38;5;241m>\033[0m ";
+    // Helper: fire title generation after the first successful response.
+    auto maybe_generate_title = [&](const std::string& user_msg,
+                                     const std::string& response_snippet) {
+        if (title_generated.exchange(true)) return;  // already done
+        generate_title_async(orch.client(), user_msg, response_snippet, tui);
+    };
 
-        std::string line;
-        if (!rl.read_line(prompt, line)) {
-            std::cout << "\n";
-            break;
-        }
-        tui.begin_output();  // reposition cursor in scroll region before any output
-        if (line.empty()) continue;
-
-        // Intercept bare exit/quit commands (no slash required)
-        {
-            std::string lower = line;
-            for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            // trim whitespace
-            while (!lower.empty() && lower.back()  == ' ') lower.pop_back();
-            while (!lower.empty() && lower.front() == ' ') lower.erase(lower.begin());
-
-            if (lower == "exit" || lower == "quit" || lower == "q" ||
-                lower == "bye"  || lower == ":q") {
-                if (loops.has_active() && !exit_warned) {
-                    std::cout << "WARN: " << loops.active_count()
-                              << " loop(s) still running.\n";
-                    std::cout << "Type 'exit' again to force quit, or /loops to review.\n";
-                    exit_warned = true;
-                    continue;
-                }
-                break;
-            } else {
-                exit_warned = false;
-            }
-        }
+    // All command handling lives in this lambda, called from the exec thread.
+    auto handle = [&](const std::string& line) {
+        tui.begin_output();
 
         if (line[0] == '/') {
             // Parse command
@@ -1078,20 +1172,22 @@ static void cmd_interactive() {
             std::string cmd;
             iss >> cmd;
 
-            if (cmd == "quit" || cmd == "exit" || cmd == "q") break;
+            if (cmd == "quit" || cmd == "exit" || cmd == "q") {
+                quit_requested = true; return;
+            }
 
             if (cmd == "list") {
                 for (auto& id : orch.list_agents())
                     std::cout << "  " << id << "\n";
-                continue;
+                return;
             }
             if (cmd == "status") {
                 std::cout << orch.global_status();
-                continue;
+                return;
             }
             if (cmd == "tokens") {
                 std::cout << tracker.format_summary();
-                continue;
+                return;
             }
             if (cmd == "use" || cmd == "switch") {
                 std::string id;
@@ -1103,7 +1199,7 @@ static void cmd_interactive() {
                 } else {
                     std::cout << "ERR: no agent '" << id << "'\n";
                 }
-                continue;
+                return;
             }
             if (cmd == "send") {
                 std::string id;
@@ -1130,13 +1226,14 @@ static void cmd_interactive() {
                                   << tracker.format_footer(resp, orch.get_agent_model(id))
                                   << "\033[0m\n";
                         tui.update(current_agent, current_model, tracker.format_session_stats());
+                        maybe_generate_title(msg, resp.content);
                     } else {
                         std::cout << "\033[38;5;167mERR: " << resp.error << "\033[0m\n";
                     }
                 } catch (const std::exception& e) {
                     std::cout << "\033[38;5;167mERR: " << e.what() << "\033[0m\n";
                 }
-                continue;
+                return;
             }
             if (cmd == "ask") {
                 std::string query;
@@ -1161,13 +1258,14 @@ static void cmd_interactive() {
                                   << tracker.format_footer(resp, orch.get_agent_model("claudius"))
                                   << "\033[0m\n";
                         tui.update(current_agent, current_model, tracker.format_session_stats());
+                        maybe_generate_title(query, resp.content);
                     } else {
                         std::cout << "\033[38;5;167mERR: " << resp.error << "\033[0m\n";
                     }
                 } catch (const std::exception& e) {
                     std::cout << "\033[38;5;167mERR: " << e.what() << "\033[0m\n";
                 }
-                continue;
+                return;
             }
             if (cmd == "create") {
                 std::string id;
@@ -1181,7 +1279,7 @@ static void cmd_interactive() {
                 } catch (const std::exception& e) {
                     std::cout << "ERR: " << e.what() << "\n";
                 }
-                continue;
+                return;
             }
             if (cmd == "remove") {
                 std::string id;
@@ -1189,7 +1287,7 @@ static void cmd_interactive() {
                 orch.remove_agent(id);
                 std::cout << "Removed: " << id << "\n";
                 if (current_agent == id) current_agent = "claudius";
-                continue;
+                return;
             }
             if (cmd == "reset") {
                 std::string id;
@@ -1201,7 +1299,7 @@ static void cmd_interactive() {
                 } catch (const std::exception& e) {
                     std::cout << "ERR: " << e.what() << "\n";
                 }
-                continue;
+                return;
             }
             if (cmd == "loop") {
                 std::string id;
@@ -1211,19 +1309,19 @@ static void cmd_interactive() {
                 if (!prompt.empty() && prompt[0] == ' ') prompt.erase(0, 1);
                 if (id.empty() || prompt.empty()) {
                     std::cout << "Usage: /loop <agent> <initial prompt>\n";
-                    continue;
+                    return;
                 }
                 if (id != "claudius" && !orch.has_agent(id)) {
                     std::cout << "ERR: no agent '" << id << "'\n";
-                    continue;
+                    return;
                 }
                 std::string lid = loops.start(orch, id, prompt, &tracker);
                 std::cout << "Loop started: " << lid << " (agent: " << id << ")\n";
-                continue;
+                return;
             }
             if (cmd == "loops") {
                 std::cout << loops.list();
-                continue;
+                return;
             }
             if (cmd == "kill") {
                 std::string lid;
@@ -1232,7 +1330,7 @@ static void cmd_interactive() {
                     std::cout << "Killed: " << lid << "\n";
                 else
                     std::cout << "ERR: no loop '" << lid << "'\n";
-                continue;
+                return;
             }
             if (cmd == "suspend") {
                 std::string lid;
@@ -1241,7 +1339,7 @@ static void cmd_interactive() {
                     std::cout << "Suspended: " << lid << "\n";
                 else
                     std::cout << "ERR: no loop '" << lid << "' or not running\n";
-                continue;
+                return;
             }
             if (cmd == "resume") {
                 std::string lid;
@@ -1250,7 +1348,7 @@ static void cmd_interactive() {
                     std::cout << "Resumed: " << lid << "\n";
                 else
                     std::cout << "ERR: no loop '" << lid << "' or not suspended\n";
-                continue;
+                return;
             }
             if (cmd == "inject") {
                 std::string lid;
@@ -1262,30 +1360,30 @@ static void cmd_interactive() {
                     std::cout << "Injected into " << lid << "\n";
                 else
                     std::cout << "ERR: no loop '" << lid << "'\n";
-                continue;
+                return;
             }
             if (cmd == "log") {
                 std::string lid;
                 iss >> lid;
                 if (lid.empty()) {
                     std::cout << "Usage: /log <loop-id> [last-N]\n";
-                    continue;
+                    return;
                 }
                 int n = 0;
                 iss >> n;
                 std::cout << loops.log(lid, n);
-                continue;
+                return;
             }
             if (cmd == "watch") {
                 std::string lid;
                 iss >> lid;
                 if (lid.empty()) {
                     std::cout << "Usage: /watch <loop-id>\n";
-                    continue;
+                    return;
                 }
                 if (loops.is_stopped(lid) && loops.log_count(lid) == 0) {
                     std::cout << "ERR: no loop '" << lid << "'\n";
-                    continue;
+                    return;
                 }
                 // Dump everything buffered so far
                 size_t seen = loops.log_count(lid);
@@ -1328,21 +1426,21 @@ static void cmd_interactive() {
                     }
                 }
                 std::cout.flush();
-                continue;
+                return;
             }
             if (cmd == "fetch") {
                 std::string url;
                 iss >> url;
                 if (url.empty()) {
                     std::cout << "Usage: /fetch <url>\n";
-                    continue;
+                    return;
                 }
                 thinking.start("fetching");
                 std::string content = fetch_url(url);
                 thinking.stop();
                 if (content.substr(0, 4) == "ERR:") {
                     std::cout << "\033[38;5;167m" << content << "\033[0m\n";
-                    continue;
+                    return;
                 }
                 static constexpr size_t kFetchLimit = 32768;
                 if (content.size() > kFetchLimit) {
@@ -1372,7 +1470,7 @@ static void cmd_interactive() {
                     thinking.stop();
                     std::cout << "\033[38;5;167mERR: " << ex.what() << "\033[0m\n";
                 }
-                continue;
+                return;
             }
             if (cmd == "mem") {
                 std::string subcmd;
@@ -1383,7 +1481,7 @@ static void cmd_interactive() {
                     if (!text.empty() && text[0] == ' ') text.erase(0, 1);
                     if (text.empty()) {
                         std::cout << "Usage: /mem write <text>\n";
-                        continue;
+                        return;
                     }
                     write_memory(current_agent, text);
                     std::cout << "Memory written for " << current_agent << "\n";
@@ -1391,7 +1489,7 @@ static void cmd_interactive() {
                     std::string mem = read_memory(current_agent);
                     if (mem.empty()) {
                         std::cout << "No memory for " << current_agent << "\n";
-                        continue;
+                        return;
                     }
                     // Inject memory into agent context
                     std::string msg = "[MEMORY for " + current_agent + "]:\n" +
@@ -1425,7 +1523,7 @@ static void cmd_interactive() {
                 } else {
                     std::cout << "Usage: /mem write <text> | /mem read | /mem show | /mem clear\n";
                 }
-                continue;
+                return;
             }
             if (cmd == "model") {
                 std::string id, model;
@@ -1433,7 +1531,7 @@ static void cmd_interactive() {
                 if (id.empty() || model.empty()) {
                     std::cout << "Usage: /model <agent-id> <model-id>\n";
                     std::cout << "  e.g. /model researcher claude-haiku-4-5-20251001\n";
-                    continue;
+                    return;
                 }
                 try {
                     orch.get_agent(id).config_mut().model = model;
@@ -1441,7 +1539,7 @@ static void cmd_interactive() {
                 } catch (const std::exception& ex) {
                     std::cout << "ERR: " << ex.what() << "\n";
                 }
-                continue;
+                return;
             }
             if (cmd == "help") {
                 std::cout << "Commands:\n"
@@ -1474,11 +1572,11 @@ static void cmd_interactive() {
                     "  /quit                            — exit\n"
                     "\n"
                     "Plain text sends to current agent.\n";
-                continue;
+                return;
             }
 
             std::cout << "Unknown command. /help for list.\n";
-            continue;
+            return;
         }
 
         // Plain text → stream to current agent
@@ -1500,18 +1598,68 @@ static void cmd_interactive() {
                 std::cout << "\033[38;5;238m  "
                           << tracker.format_footer(resp, orch.get_agent_model(current_agent))
                           << "\033[0m\n";
-                char buf[16];
-                snprintf(buf, sizeof(buf), "$%.4f", tracker.session_cost());
-                tui.update(current_agent, current_model, buf);
+                tui.update(current_agent, current_model, tracker.format_session_stats());
+                maybe_generate_title(line, resp.content);
             } else {
                 std::cout << "\033[38;5;167mERR: " << resp.error << "\033[0m\n";
             }
         } catch (const std::exception& e) {
             std::cout << "\033[38;5;167mERR: " << e.what() << "\033[0m\n";
         }
+    };  // end handle lambda
+
+    // Execution thread: drains the command queue serially.
+    std::thread exec_thread([&]() {
+        std::string line;
+        while (cmd_queue.pop(line)) {
+            cmd_queue.set_busy(true);
+            handle(line);
+            cmd_queue.set_busy(false);
+        }
+    });
+
+    // ── Main readline loop ────────────────────────────────────────────────────
+    // Pushes commands to the queue immediately; never blocks on execution.
+    bool exit_warned = false;
+    while (!quit_requested) {
+        if (g_winch) { g_winch = 0; tui.resize(); }
+
+        tui.begin_input(cmd_queue.depth());
+        static const std::string kPrompt = "\033[38;5;241m>\033[0m ";
+
+        std::string line;
+        if (!rl.read_line(kPrompt, line)) break;
+        if (line.empty()) continue;
+
+        // Exit commands handled immediately — don't queue.
+        {
+            std::string lower = line;
+            for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            while (!lower.empty() && lower.back()  == ' ') lower.pop_back();
+            while (!lower.empty() && lower.front() == ' ') lower.erase(lower.begin());
+            if (lower == "exit" || lower == "quit" || lower == "q" ||
+                lower == "bye"  || lower == ":q"   ||
+                lower == "/quit"|| lower == "/exit" || lower == "/q") {
+                if (cmd_queue.depth() > 0 && !exit_warned) {
+                    tui.set_status("WARN: " + std::to_string(cmd_queue.depth())
+                                   + " queued — type 'exit' again to force quit");
+                    exit_warned = true;
+                    continue;
+                }
+                break;
+            }
+            exit_warned = false;
+        }
+
+        cmd_queue.push(line);
+        // Acknowledge the queued command in the status bar.
+        tui.set_status("queued");
     }
 
-    // Restore terminal and print session summary
+    cmd_queue.stop();
+    exec_thread.join();
+
+    // Restore terminal and print session summary.
     tui.shutdown();
     std::cout << "\n";
     if (tracker.session_cost() > 0.0) {

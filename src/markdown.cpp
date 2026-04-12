@@ -155,7 +155,7 @@ std::string MarkdownRenderer::process_line(const std::string& line) {
         for (auto** p = kCmdPrefixes; *p; ++p) {
             size_t plen = strlen(*p);
             if (line.size() >= plen && line.substr(0, plen) == *p) {
-                return fg(172) + std::string(DIM) + "  ❯ " + line + RST;
+                return fg(172) + std::string(DIM) + "  > " + line + RST;
             }
         }
     }
