@@ -11,6 +11,17 @@ Agent::Agent(const std::string& id, Constitution config, ApiClient& client)
     stats_.created = std::chrono::steady_clock::now();
 }
 
+// Prepend context summary as a synthetic leading exchange so the model has
+// continuity without re-paying the token cost of the full prior history.
+static std::vector<Message> inject_summary(const std::string& summary,
+                                           std::vector<Message> msgs) {
+    if (summary.empty()) return msgs;
+    msgs.insert(msgs.begin(), Message{"assistant", "Context loaded."});
+    msgs.insert(msgs.begin(),
+        Message{"user", "[CONTEXT SUMMARY]\n" + summary + "\n[END CONTEXT SUMMARY]"});
+    return msgs;
+}
+
 ApiResponse Agent::send(const std::string& user_message) {
     // Add user message to history
     history_.push_back(Message{"user", user_message});
@@ -18,7 +29,10 @@ ApiResponse Agent::send(const std::string& user_message) {
     // Trim BEFORE building the request so we never send a bloated history.
     // Threshold: keep 8 messages; trim when we exceed 12.
     if (history_.size() > 12) {
+        size_t before = history_.size();
         trim_history(8);
+        fprintf(stderr, "[%s] context trimmed: %zu → %zu messages (oldest dropped)\n",
+                id_.c_str(), before, history_.size());
     }
 
     // Build request
@@ -27,7 +41,7 @@ ApiResponse Agent::send(const std::string& user_message) {
     req.system_prompt = config_.build_system_prompt();
     req.max_tokens    = config_.max_tokens;
     req.temperature   = config_.temperature;
-    req.messages      = history_;
+    req.messages      = inject_summary(context_summary_, history_);
     req.advisor_model = config_.advisor_model;
 
     auto resp = client_.complete(req);
@@ -62,14 +76,19 @@ ApiResponse Agent::send(const std::string& user_message) {
 
 ApiResponse Agent::stream(const std::string& user_message, StreamCallback cb) {
     history_.push_back(Message{"user", user_message});
-    if (history_.size() > 12) trim_history(8);
+    if (history_.size() > 12) {
+        size_t before = history_.size();
+        trim_history(8);
+        fprintf(stderr, "[%s] context trimmed: %zu → %zu messages (oldest dropped)\n",
+                id_.c_str(), before, history_.size());
+    }
 
     ApiRequest req;
     req.model         = config_.model;
     req.system_prompt = config_.build_system_prompt();
     req.max_tokens    = config_.max_tokens;
     req.temperature   = config_.temperature;
-    req.messages      = history_;
+    req.messages      = inject_summary(context_summary_, history_);
     req.advisor_model = config_.advisor_model;
 
     auto resp = client_.stream(req, cb);
@@ -111,6 +130,41 @@ void Agent::trim_history(int keep_last_n) {
             history_.erase(history_.begin());
         }
     }
+}
+
+std::string Agent::compact() {
+    if (history_.empty()) return "";
+
+    // Build a plain-text transcript of the current history.
+    std::ostringstream transcript;
+    for (auto& m : history_) {
+        transcript << m.role << ": " << m.content << "\n\n";
+    }
+
+    // One-shot summarization request — does NOT touch history_.
+    ApiRequest req;
+    req.model       = config_.model;
+    req.max_tokens  = 1024;
+    req.temperature = 0.3;
+    req.system_prompt =
+        "You are a context compactor. Given a conversation transcript, produce a "
+        "concise continuity summary. Capture: decisions made, facts established, "
+        "tasks completed or in-progress, open questions, and current working state. "
+        "Plain text only. No markdown. No pleasantries. Be as brief as the content allows.";
+    req.messages = {{
+        "user",
+        "Summarize this conversation for context continuity:\n\n"
+        "[TRANSCRIPT]\n" + transcript.str() + "[END TRANSCRIPT]"
+    }};
+
+    auto resp = client_.complete(req);
+    if (!resp.ok || resp.content.empty()) return "";
+
+    // Store as session memory and clear the window.
+    context_summary_ = resp.content;
+    history_.clear();
+
+    return context_summary_;
 }
 
 std::string Agent::status_summary() const {

@@ -35,12 +35,20 @@ public:
     // Truncate history to keep token usage bounded
     void trim_history(int keep_last_n = 10);
 
+    // Context compaction: summarize current history via API, store as session
+    // memory, clear the window.  Returns the summary text, or "" on failure.
+    // The summary is injected as a synthetic leading exchange on every
+    // subsequent API call so the agent retains continuity without the token
+    // cost of the full history.  The summary is NOT persisted to disk.
+    std::string compact();
+
     // Accessors
     const std::string& id() const { return id_; }
     const Constitution& config() const { return config_; }
     Constitution& config_mut() { return config_; }
     const AgentStats& stats() const { return stats_; }
     const std::vector<Message>& history() const { return history_; }
+    const std::string& context_summary() const { return context_summary_; }
 
     // Status summary (caveman-compressed)
     std::string status_summary() const;
@@ -54,6 +62,9 @@ private:
     ApiClient& client_;
     std::vector<Message> history_;
     AgentStats stats_;
+    // In-session context summary produced by compact().  Injected as synthetic
+    // leading exchange on every API call.  Not serialized; lives only in RAM.
+    std::string context_summary_;
 };
 
 } // namespace claudius

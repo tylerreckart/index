@@ -92,6 +92,9 @@ static std::string claudius_prompt(Brevity level) {
         "  /mem read                     — load your persistent memory into context\n"
         "  /mem show                     — display raw memory file\n"
         "  /mem clear                    — delete your memory file\n"
+        "  /mem shared write <text>      — append to pipeline-shared scratchpad (visible to all agents)\n"
+        "  /mem shared read              — read the shared scratchpad\n"
+        "  /mem shared clear             — clear the shared scratchpad\n"
         "Results arrive in the next message as [TOOL RESULTS].\n"
         "\n"
         "COMMAND RULES:\n"
@@ -160,6 +163,8 @@ static std::string writer_prompt() {
         "  /mem read                     — load persistent memory into context\n"
         "  /mem show                     — display raw memory file\n"
         "  /mem clear                    — delete memory file\n"
+        "  /mem shared write <text>      — write to pipeline-shared scratchpad (visible to all agents)\n"
+        "  /mem shared read              — read the shared scratchpad (pick up what other agents wrote)\n"
         "Results arrive in the next message as [TOOL RESULTS].\n"
         "\n"
         "COMMAND RULES:\n"
@@ -227,6 +232,8 @@ static std::string planner_prompt() {
         "  /write <path>                 — write the plan file; content follows until /endwrite\n"
         "  /mem write <text>             — save plan state across sessions\n"
         "  /mem read                     — load prior context\n"
+        "  /mem shared write <text>      — write findings to shared scratchpad for other agents\n"
+        "  /mem shared read              — read what other agents have left in the shared scratchpad\n"
         "Results arrive in the next message as [TOOL RESULTS].\n"
         "\n"
         "COMMAND RULES:\n"
@@ -353,6 +360,12 @@ std::string Constitution::to_json() const {
     for (auto& r : rules) arr->as_array_mut().push_back(jstr(r));
     m["rules"] = arr;
 
+    if (!capabilities.empty()) {
+        auto cap = jarr();
+        for (auto& c : capabilities) cap->as_array_mut().push_back(jstr(c));
+        m["capabilities"] = cap;
+    }
+
     return json_serialize(*obj);
 }
 
@@ -374,6 +387,12 @@ Constitution Constitution::from_json(const std::string& json_str) {
     if (rules_val && rules_val->is_array()) {
         for (auto& r : rules_val->as_array()) {
             if (r && r->is_string()) c.rules.push_back(r->as_string());
+        }
+    }
+    auto cap_val = root->get("capabilities");
+    if (cap_val && cap_val->is_array()) {
+        for (auto& v : cap_val->as_array()) {
+            if (v && v->is_string()) c.capabilities.push_back(v->as_string());
         }
     }
     return c;

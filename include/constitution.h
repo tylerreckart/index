@@ -38,6 +38,12 @@ struct Constitution {
     std::string goal;               // what this agent is trying to accomplish
     std::vector<std::string> rules; // explicit behavioral constraints
 
+    // --- Routing signal ---
+    // Tools this agent is designed to use.  Shown in the master's roster so
+    // Claudius can route based on capability rather than inferring from goal text.
+    // Example: {"/fetch", "/mem"} for researcher, {"/exec", "/write"} for devops.
+    std::vector<std::string> capabilities;
+
     // --- Computed ---
     std::string build_system_prompt() const;
 

@@ -335,6 +335,36 @@ void cmd_mem_clear(const std::string& agent_id, const std::string& memory_dir) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared scratchpad — pipeline-scoped, visible to all agents
+// ---------------------------------------------------------------------------
+
+static std::string shared_mem_path(const std::string& memory_dir) {
+    return memory_dir + "/shared.md";
+}
+
+std::string cmd_mem_shared_read(const std::string& memory_dir) {
+    std::ifstream f(shared_mem_path(memory_dir));
+    if (!f.is_open()) return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+void cmd_mem_shared_write(const std::string& text, const std::string& memory_dir) {
+    fs::create_directories(memory_dir);
+    std::ofstream f(shared_mem_path(memory_dir), std::ios::app);
+    if (!f.is_open()) return;
+    std::time_t now = std::time(nullptr);
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+    f << "\n<!-- " << ts << " -->\n" << text << "\n";
+}
+
+void cmd_mem_shared_clear(const std::string& memory_dir) {
+    fs::remove(shared_mem_path(memory_dir));
+}
+
+// ---------------------------------------------------------------------------
 // execute_agent_commands
 // ---------------------------------------------------------------------------
 
@@ -381,7 +411,30 @@ std::string execute_agent_commands(const std::vector<AgentCommand>& cmds,
             std::string subcmd;
             iss >> subcmd;
 
-            if (subcmd == "write") {
+            if (subcmd == "shared") {
+                // /mem shared write <text> | /mem shared read | /mem shared clear
+                std::string action;
+                iss >> action;
+                if (action == "write") {
+                    std::string text;
+                    std::getline(iss, text);
+                    if (!text.empty() && text[0] == ' ') text.erase(0, 1);
+                    cmd_mem_shared_write(text, memory_dir);
+                    out << "[/mem shared write] OK: written to shared scratchpad\n\n";
+                } else if (action == "read" || action == "show") {
+                    std::string mem = cmd_mem_shared_read(memory_dir);
+                    out << "[/mem shared read]\n"
+                        << (mem.empty() ? "(shared scratchpad empty)" : mem)
+                        << "\n[END SHARED MEMORY]\n\n";
+                } else if (action == "clear") {
+                    cmd_mem_shared_clear(memory_dir);
+                    out << "[/mem shared clear] OK: shared scratchpad cleared\n\n";
+                } else {
+                    out << "[/mem shared] ERR: unknown action '" << action
+                        << "' — use write, read, or clear\n\n";
+                }
+
+            } else if (subcmd == "write") {
                 std::string text;
                 std::getline(iss, text);
                 if (!text.empty() && text[0] == ' ') text.erase(0, 1);

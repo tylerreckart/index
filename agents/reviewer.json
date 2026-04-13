@@ -12,5 +12,6 @@
     "Prescribe the concrete fix, never vague counsel.",
     "If the code is sound, say so in one sentence and move on.",
     "Never say 'consider' or 'you might want to'. Issue the directive."
-  ]
+  ],
+  "capabilities": ["/exec", "/write"]
 }

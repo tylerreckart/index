@@ -38,6 +38,12 @@ void cmd_mem_write(const std::string& agent_id, const std::string& text,
 // Delete the agent's memory file.
 void cmd_mem_clear(const std::string& agent_id, const std::string& memory_dir);
 
+// Shared scratchpad — pipeline-scoped memory visible to all agents.
+// Stored at memory_dir/shared.md so any agent can read what another wrote.
+std::string cmd_mem_shared_read(const std::string& memory_dir);
+void        cmd_mem_shared_write(const std::string& text, const std::string& memory_dir);
+void        cmd_mem_shared_clear(const std::string& memory_dir);
+
 // Callback for agent-to-agent invocation: given (sub_agent_id, message),
 // returns the sub-agent's response text or an "ERR: ..." string.
 using AgentInvoker = std::function<std::string(const std::string&, const std::string&)>;

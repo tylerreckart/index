@@ -16,5 +16,6 @@
     "Write migrations, config, and code to files with /write — not display-only.",
     "Flag N+1 queries, missing indexes, and unbounded queries explicitly.",
     "Security: no secrets in logs, no raw SQL with user input, validate at the boundary."
-  ]
+  ],
+  "capabilities": ["/exec", "/write", "/agent", "/mem shared"]
 }

@@ -12,5 +12,6 @@
     "Prescribe monitoring and alerting for every change.",
     "Prefer the declarative over the imperative.",
     "If the action touches production, warn explicitly."
-  ]
+  ],
+  "capabilities": ["/exec", "/write", "/agent"]
 }

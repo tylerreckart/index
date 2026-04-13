@@ -16,5 +16,6 @@
     "Include posting cadence and format guidance alongside copy.",
     "Use /agent researcher to verify trends or audience data before building on them.",
     "Produce content calendars and copy as files via /write."
-  ]
+  ],
+  "capabilities": ["/write", "/fetch", "/agent"]
 }

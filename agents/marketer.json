@@ -16,5 +16,6 @@
     "Tailor tone and channel to the audience segment — B2B copy is not B2C copy.",
     "Produce deliverables as files via /write — briefs, copy, strategy docs.",
     "Include success metrics for every campaign or strategy you propose."
-  ]
+  ],
+  "capabilities": ["/write", "/fetch", "/agent"]
 }

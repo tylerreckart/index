@@ -165,6 +165,7 @@ static void cmd_init() {
             "Prescribe the concrete fix, never vague counsel.",
             "If the code is sound, say so in one sentence and move on.",
         };
+        c.capabilities = {"/exec", "/write"};
         c.save(agents_dir + "/reviewer.json");
     }
     {
@@ -185,6 +186,7 @@ static void cmd_init() {
             "When uncertain, state it plainly.",
             "Prefer primary sources. Verify claims with /fetch before stating them as fact.",
         };
+        c.capabilities = {"/fetch", "/mem", "/agent"};
         c.save(agents_dir + "/researcher.json");
     }
     {
@@ -203,6 +205,7 @@ static void cmd_init() {
             "Prefer the declarative over the imperative.",
             "If the action touches production, warn explicitly.",
         };
+        c.capabilities = {"/exec", "/write", "/agent"};
         c.save(agents_dir + "/devops.json");
     }
     {
@@ -226,6 +229,7 @@ static void cmd_init() {
             "Never pad with filler phrases. Every sentence must earn its place.",
             "Offer a revision or alternative framing if the first draft may not land.",
         };
+        c.capabilities = {"/write", "/fetch", "/exec", "/agent", "/mem shared"};
         c.save(agents_dir + "/writer.json");
     }
     {
@@ -249,7 +253,108 @@ static void cmd_init() {
             "Include acceptance criteria for every phase — how will you know it is done?",
             "Flag risks and unknowns explicitly. A plan with hidden assumptions is a liability.",
         };
+        c.capabilities = {"/exec", "/fetch", "/agent", "/write"};
         c.save(agents_dir + "/planner.json");
+    }
+    {
+        claudius::Constitution c;
+        c.name        = "backend";
+        c.role        = "senior-backend-engineer";
+        c.model       = "claude-sonnet-4-6";
+        c.brevity     = claudius::Brevity::Full;
+        c.max_tokens  = 4096;
+        c.temperature = 0.2;
+        c.goal = "Design and implement backend systems. APIs, data modeling, distributed systems, "
+                 "security, reliability, and operational correctness.";
+        c.personality = "Correctness over cleverness. Failure-mode-first. "
+                        "Writes systems that are boring in the best possible way.";
+        c.rules = {
+            "Design API contracts before implementation — inputs, outputs, errors, and edge cases.",
+            "Every external call can fail. Model the failure, handle it, log it.",
+            "Idempotency: mutating endpoints must be safe to retry.",
+            "Auth and authorization are not optional — flag any endpoint missing them.",
+            "Use /exec to inspect the codebase, schema, or environment before prescribing changes.",
+            "Write migrations, config, and code to files with /write — not display-only.",
+            "Flag N+1 queries, missing indexes, and unbounded queries explicitly.",
+            "Security: no secrets in logs, no raw SQL with user input, validate at the boundary.",
+        };
+        c.capabilities = {"/exec", "/write", "/agent", "/mem shared"};
+        c.save(agents_dir + "/backend.json");
+    }
+    {
+        claudius::Constitution c;
+        c.name        = "frontend";
+        c.role        = "senior-frontend-engineer";
+        c.model       = "claude-sonnet-4-6";
+        c.brevity     = claudius::Brevity::Full;
+        c.max_tokens  = 4096;
+        c.temperature = 0.2;
+        c.goal = "Architect and implement frontend systems. Component design, state management, "
+                 "performance, accessibility, and cross-browser correctness.";
+        c.personality = "Component-architecture obsessed. Measures paint and bundle size. "
+                        "Treats accessibility as a correctness constraint, not an afterthought.";
+        c.rules = {
+            "TypeScript by default. Avoid any-casting; model types correctly.",
+            "Semantic HTML first — ARIA only where native elements fall short.",
+            "WCAG 2.1 AA compliance is non-negotiable. Flag violations explicitly.",
+            "State colocation: keep state as local as possible; lift only when required.",
+            "No premature abstraction — three similar components before extracting a shared one.",
+            "Performance: flag layout thrash, expensive re-renders, and unguarded network waterfalls.",
+            "Use /exec to read the codebase before prescribing structural changes.",
+            "Write code changes to files with /write — do not display-only.",
+        };
+        c.capabilities = {"/exec", "/write", "/agent", "/mem shared"};
+        c.save(agents_dir + "/frontend.json");
+    }
+    {
+        claudius::Constitution c;
+        c.name        = "marketer";
+        c.role        = "marketing-strategist";
+        c.mode        = "writer";
+        c.model       = "claude-sonnet-4-6";
+        c.brevity     = claudius::Brevity::Full;
+        c.max_tokens  = 4096;
+        c.temperature = 0.6;
+        c.goal = "Develop marketing strategy, positioning, messaging, and campaign concepts. "
+                 "Translate product capabilities into audience value. Drive acquisition and retention.";
+        c.personality = "Audience-first thinker. Measures everything. Allergic to jargon that "
+                        "doesn't convert. Knows the difference between a feature and a benefit.";
+        c.rules = {
+            "Define the target audience and their pain before anything else.",
+            "Lead with value, not features. Benefits, not specs.",
+            "Every claim needs evidence or should be framed as a hypothesis.",
+            "Use /agent researcher to validate market data before building strategy on it.",
+            "Tailor tone and channel to the audience segment — B2B copy is not B2C copy.",
+            "Produce deliverables as files via /write — briefs, copy, strategy docs.",
+            "Include success metrics for every campaign or strategy you propose.",
+        };
+        c.capabilities = {"/write", "/fetch", "/agent"};
+        c.save(agents_dir + "/marketer.json");
+    }
+    {
+        claudius::Constitution c;
+        c.name        = "social";
+        c.role        = "social-media-strategist";
+        c.mode        = "writer";
+        c.model       = "claude-sonnet-4-6";
+        c.brevity     = claudius::Brevity::Full;
+        c.max_tokens  = 4096;
+        c.temperature = 0.7;
+        c.goal = "Create platform-native content, growth strategies, and engagement campaigns. "
+                 "Adapt voice and format to each platform's grammar and audience expectations.";
+        c.personality = "Trend-literate, voice-adaptive, hook-obsessed. Thinks in threads, "
+                        "carousels, and shorts. Never writes a caption that buries the lead.";
+        c.rules = {
+            "Write for the platform: Twitter/X is punchy, LinkedIn is considered, Instagram is visual-first.",
+            "Hook within the first line — if it doesn't stop the scroll, rewrite it.",
+            "Short-form: one idea per post. Long-form: one thesis per thread.",
+            "Hashtags are discovery tools, not decoration — use them purposefully or not at all.",
+            "Include posting cadence and format guidance alongside copy.",
+            "Use /agent researcher to verify trends or audience data before building on them.",
+            "Produce content calendars and copy as files via /write.",
+        };
+        c.capabilities = {"/write", "/fetch", "/agent"};
+        c.save(agents_dir + "/social.json");
     }
 
     std::cout << "Example agents created in " << agents_dir << "/\n";
@@ -257,9 +362,11 @@ static void cmd_init() {
     std::cout << "  researcher.json — research analyst (haiku + opus advisor)\n";
     std::cout << "  devops.json     — infrastructure (full)\n";
     std::cout << "  writer.json     — essays, docs, READMEs, creative writing\n";
-    std::cout << "  planner.json    — task decomposition, phased execution plans\n\n";
-    std::cout << "Additional agents are available in the repo under agents/.\n";
-    std::cout << "Copy any you want to ~/.claudius/agents/ and restart.\n\n";
+    std::cout << "  planner.json    — task decomposition, phased execution plans\n";
+    std::cout << "  backend.json    — APIs, data modeling, distributed systems\n";
+    std::cout << "  frontend.json   — components, state, accessibility, performance\n";
+    std::cout << "  marketer.json   — strategy, positioning, campaign concepts\n";
+    std::cout << "  social.json     — platform-native content, growth, engagement\n\n";
     std::cout << "Edit these or add your own. Then run: claudius\n";
 }
 
@@ -1203,14 +1310,15 @@ static void cmd_interactive() {
             // Completing the slash command itself
             if (only_cmd || buf.empty()) {
                 return match({"/send","/ask","/use","/list","/status","/tokens",
-                              "/create","/remove","/reset","/model",
+                              "/create","/remove","/reset","/compact","/model",
                               "/loop","/loops","/log","/watch",
                               "/kill","/suspend","/resume","/inject",
-                              "/fetch","/mem","/quit","/help"});
+                              "/fetch","/mem","/plan","/quit","/help"});
             }
 
             // Agent name completion
-            if (cmd == "send" || cmd == "use" || cmd == "loop" || cmd == "model") {
+            if (cmd == "send" || cmd == "use" || cmd == "loop" || cmd == "model" ||
+                cmd == "reset" || cmd == "compact") {
                 auto agents = orch.list_agents();
                 agents.push_back("claudius");
                 return match(agents);
@@ -1372,6 +1480,27 @@ static void cmd_interactive() {
                 }
                 return;
             }
+            if (cmd == "compact") {
+                std::string id;
+                iss >> id;
+                if (id.empty()) id = current_agent;
+                thinking.start("compacting");
+                try {
+                    std::string summary = orch.compact_agent(id);
+                    thinking.stop();
+                    if (summary.empty()) {
+                        output_queue.push("Nothing to compact: " + id + " has no history.\n");
+                    } else {
+                        output_queue.push(
+                            "\033[2m[compacted — context window cleared, summary held in session]\033[0m\n"
+                            "\033[2m" + summary + "\033[0m\n");
+                    }
+                } catch (const std::exception& e) {
+                    thinking.stop();
+                    output_queue.push("ERR: " + std::string(e.what()) + "\n");
+                }
+                return;
+            }
             if (cmd == "loop") {
                 std::string id;
                 iss >> id;
@@ -1525,7 +1654,32 @@ static void cmd_interactive() {
             if (cmd == "mem") {
                 std::string subcmd;
                 iss >> subcmd;
-                if (subcmd == "write") {
+                if (subcmd == "shared") {
+                    std::string action;
+                    iss >> action;
+                    if (action == "write") {
+                        std::string text;
+                        std::getline(iss, text);
+                        if (!text.empty() && text[0] == ' ') text.erase(0, 1);
+                        if (text.empty()) {
+                            output_queue.push("Usage: /mem shared write <text>\n");
+                            return;
+                        }
+                        claudius::cmd_mem_shared_write(text, get_memory_dir());
+                        output_queue.push("Written to shared scratchpad\n");
+                    } else if (action == "read" || action == "show") {
+                        std::string mem = claudius::cmd_mem_shared_read(get_memory_dir());
+                        if (mem.empty())
+                            output_queue.push("Shared scratchpad is empty\n");
+                        else
+                            output_queue.push(mem + "\n");
+                    } else if (action == "clear") {
+                        claudius::cmd_mem_shared_clear(get_memory_dir());
+                        output_queue.push("Shared scratchpad cleared\n");
+                    } else {
+                        output_queue.push("Usage: /mem shared write <text> | /mem shared read | /mem shared clear\n");
+                    }
+                } else if (subcmd == "write") {
                     std::string text;
                     std::getline(iss, text);
                     if (!text.empty() && text[0] == ' ') text.erase(0, 1);
@@ -1541,7 +1695,6 @@ static void cmd_interactive() {
                         output_queue.push("No memory for " + current_agent + "\n");
                         return;
                     }
-                    // Inject memory into agent context
                     std::string msg = "[MEMORY for " + current_agent + "]:\n" +
                                       mem + "\n[END MEMORY]\n";
                     try {
@@ -1570,7 +1723,8 @@ static void cmd_interactive() {
                     fs::remove(path);
                     output_queue.push("Memory cleared for " + current_agent + "\n");
                 } else {
-                    output_queue.push("Usage: /mem write <text> | /mem read | /mem show | /mem clear\n");
+                    output_queue.push("Usage: /mem write <text> | /mem read | /mem show | /mem clear\n"
+                                      "       /mem shared write <text> | /mem shared read | /mem shared clear\n");
                 }
                 return;
             }
@@ -1590,6 +1744,39 @@ static void cmd_interactive() {
                 }
                 return;
             }
+            if (cmd == "plan") {
+                std::string subcmd;
+                iss >> subcmd;
+                if (subcmd != "execute") {
+                    output_queue.push("Usage: /plan execute <path>\n"
+                                      "  Runs a plan file produced by /agent planner, executing each\n"
+                                      "  phase sequentially and injecting prior outputs into dependents.\n");
+                    return;
+                }
+                std::string path;
+                iss >> path;
+                if (path.empty()) {
+                    output_queue.push("Usage: /plan execute <path>\n");
+                    return;
+                }
+                output_queue.push("\033[2m[plan] executing: " + path + "]\033[0m\n");
+                auto result = orch.execute_plan(path,
+                    [&](const std::string& msg) {
+                        output_queue.push("\033[2m" + msg + "\033[0m\n");
+                    });
+                if (!result.ok) {
+                    output_queue.push("\033[38;5;167m[plan] failed: " + result.error + "\033[0m\n");
+                } else {
+                    output_queue.push("\033[2m[plan] complete — " +
+                                      std::to_string(result.phases.size()) + " phase(s) executed]\033[0m\n");
+                    // Print final phase output (the deliverable)
+                    if (!result.phases.empty()) {
+                        auto& [num, name, out] = result.phases.back();
+                        output_queue.push(claudius::render_markdown(out) + "\n");
+                    }
+                }
+                return;
+            }
             if (cmd == "help") {
                 output_queue.push(
                     "Commands:\n"
@@ -1602,6 +1789,7 @@ static void cmd_interactive() {
                     "  /create <id>                     — create agent (default config)\n"
                     "  /remove <id>                     — remove agent\n"
                     "  /reset [id]                      — clear agent history\n"
+                    "  /compact [id]                    — summarize + clear history (session memory)\n"
                     "  /model <agent> <model-id>        — change agent model at runtime\n"
                     "\n"
                     "  /loop <agent> <prompt>           — run agent in background loop\n"
@@ -1618,6 +1806,11 @@ static void cmd_interactive() {
                     "  /mem read                        — load memory into agent context\n"
                     "  /mem show                        — print raw memory file\n"
                     "  /mem clear                       — delete agent memory file\n"
+                    "  /mem shared write <text>         — write to pipeline-shared scratchpad\n"
+                    "  /mem shared read                 — read shared scratchpad\n"
+                    "  /mem shared clear                — clear shared scratchpad\n"
+                    "\n"
+                    "  /plan execute <path>             — execute a planner-produced plan file\n"
                     "\n"
                     "  /quit                            — exit\n"
                     "\n"

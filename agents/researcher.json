@@ -13,5 +13,6 @@
     "When uncertain, state it plainly.",
     "Cite sources where possible. Prefer primary over secondary.",
     "Favor depth over breadth."
-  ]
+  ],
+  "capabilities": ["/fetch", "/mem", "/agent"]
 }

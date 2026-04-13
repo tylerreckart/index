@@ -1,12 +1,14 @@
 // claudius/src/orchestrator.cpp
 #include "orchestrator.h"
 #include "commands.h"
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -214,31 +216,103 @@ std::string Orchestrator::get_agent_model(const std::string& id) const {
     return it->second->config().model;
 }
 
+// Strip "claude-" prefix and trailing date suffix (e.g. -20250514) from model IDs.
+// claude-sonnet-4-20250514 → sonnet-4
+// claude-haiku-4-5-20251001 → haiku-4-5
+// claude-sonnet-4-6 → sonnet-4-6
+static std::string short_model(const std::string& model) {
+    std::string s = model;
+    if (s.size() > 7 && s.substr(0, 7) == "claude-")
+        s = s.substr(7);
+    // Strip trailing 8-digit date suffix
+    if (s.size() > 9) {
+        size_t d = s.rfind('-');
+        if (d != std::string::npos && s.size() - d - 1 == 8) {
+            bool all_digits = true;
+            for (size_t i = d + 1; i < s.size(); ++i)
+                if (!std::isdigit(static_cast<unsigned char>(s[i]))) { all_digits = false; break; }
+            if (all_digits) s = s.substr(0, d);
+        }
+    }
+    return s;
+}
+
+// Return the first N words of a rule string, with "…" if truncated.
+static std::string condense_rule(const std::string& rule, int max_words = 7) {
+    std::istringstream iss(rule);
+    std::string word, out;
+    int n = 0;
+    while (iss >> word && n < max_words) {
+        if (n) out += ' ';
+        // Strip leading punctuation artifacts like "-" or "—"
+        size_t start = word.find_first_not_of("-—•*");
+        if (start != std::string::npos && start > 0) word = word.substr(start);
+        if (word.empty()) continue;
+        out += word;
+        ++n;
+    }
+    if (iss >> word) out += "…";
+    return out;
+}
+
 std::string Orchestrator::global_status() const {
     std::lock_guard<std::mutex> lock(agents_mutex_);
     std::ostringstream ss;
 
-    // Agent roster — this is the primary signal Claudius uses for routing.
-    // Format emphasizes capability over stats; stats follow in parentheses.
     if (agents_.empty()) {
         ss << "AVAILABLE AGENTS: none loaded\n";
     } else {
         ss << "AVAILABLE AGENTS — delegate with /agent <id> <task>:\n";
         for (auto& [id, agent] : agents_) {
-            const auto& cfg = agent->config();
+            const auto& cfg  = agent->config();
+            const auto& st   = agent->stats();
+            const auto& hist = agent->history();
+
+            // Line 1: id  [role]  model  brevity  [mode:X]  [advisor:Y]
             ss << "  " << id;
             if (!cfg.role.empty())
                 ss << "  [" << cfg.role << "]";
-            if (!cfg.goal.empty())
-                ss << "  — " << cfg.goal;
-            ss << "\n";
-            // Stats on second line, indented, so they don't crowd the capability description
-            const auto& st = agent->stats();
-            ss << "    reqs:" << st.total_requests
-               << " in:" << st.total_input_tokens
-               << " out:" << st.total_output_tokens;
+            ss << "  " << short_model(cfg.model);
+            if (!cfg.mode.empty())
+                ss << "  mode:" << cfg.mode;
+            else
+                ss << "  " << brevity_to_string(cfg.brevity);
             if (!cfg.advisor_model.empty())
-                ss << " advisor:" << cfg.advisor_model;
+                ss << "  advisor:" << short_model(cfg.advisor_model);
+            ss << "\n";
+
+            // Line 2: Goal
+            if (!cfg.goal.empty())
+                ss << "    Goal: " << cfg.goal << "\n";
+
+            // Line 3: Capabilities (explicit list, or implicit from rules)
+            if (!cfg.capabilities.empty()) {
+                ss << "    Capabilities:";
+                for (auto& cap : cfg.capabilities) ss << " " << cap;
+                ss << "\n";
+            }
+
+            // Line 4: Rules — condensed to first 7 words each, joined with ·
+            if (!cfg.rules.empty()) {
+                ss << "    Rules: ";
+                bool first = true;
+                for (auto& r : cfg.rules) {
+                    std::string condensed = condense_rule(r);
+                    if (condensed.empty()) continue;
+                    if (!first) ss << " · ";
+                    ss << condensed;
+                    first = false;
+                }
+                ss << "\n";
+            }
+
+            // Line 5: context depth + request stats
+            ss << "    Context: " << hist.size() << " msgs"
+               << "  reqs:" << st.total_requests
+               << "  in:" << st.total_input_tokens
+               << "  out:" << st.total_output_tokens;
+            if (!agent->context_summary().empty())
+                ss << "  [compacted]";
             ss << "\n";
         }
     }
@@ -247,6 +321,229 @@ std::string Orchestrator::global_status() const {
        << " out:" << client_.total_output_tokens() << "\n";
 
     return ss.str();
+}
+
+// ─── Context compaction ───────────────────────────────────────────────────────
+
+std::string Orchestrator::compact_agent(const std::string& agent_id) {
+    if (agent_id == "claudius") {
+        return claudius_master_->compact();
+    }
+    return get_agent(agent_id).compact();
+}
+
+// ─── Plan execution ───────────────────────────────────────────────────────────
+
+// Parse the planner's markdown format into a list of PlanPhases.
+// Recognises:
+//   ### Phase N: <name>
+//   **Agent:** <id>
+//   **Depends on:** none | 1 | 1, 2
+//   **Task:** <description>  (may span multiple lines until next **Field:** or next phase)
+//   **Output:** <description>
+//   **Acceptance:** <criteria>
+static std::vector<Orchestrator::PlanPhase> parse_plan(const std::string& text) {
+    std::vector<Orchestrator::PlanPhase> phases;
+    std::istringstream ss(text);
+    std::string line;
+
+    Orchestrator::PlanPhase* cur = nullptr;
+    std::string active_field;   // "task" | "output" | "acceptance" | ""
+
+    // Flush any accumulated multi-line field into the current phase
+    // (nothing to flush for single-line fields, but task can span lines)
+
+    auto strip = [](std::string s) -> std::string {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\r')) s.erase(s.begin());
+        while (!s.empty() && (s.back()  == ' ' || s.back()  == '\r')) s.pop_back();
+        return s;
+    };
+
+    auto parse_depends = [](const std::string& s, std::vector<int>& out) {
+        std::istringstream iss(s);
+        std::string tok;
+        while (iss >> tok) {
+            // Strip non-digits (commas, "Phase", "none")
+            std::string digits;
+            for (char c : tok) if (std::isdigit(static_cast<unsigned char>(c))) digits += c;
+            if (!digits.empty()) out.push_back(std::stoi(digits));
+        }
+    };
+
+    auto field_match = [&](const std::string& ln, const char* label, std::string& out) -> bool {
+        // Match "**Label:** rest"
+        std::string prefix = std::string("**") + label + ":**";
+        if (ln.size() <= prefix.size()) return false;
+        if (ln.substr(0, prefix.size()) != prefix) return false;
+        out = strip(ln.substr(prefix.size()));
+        return true;
+    };
+
+    while (std::getline(ss, line)) {
+        // Strip CR
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        // Check for phase header: ### Phase N: Name
+        if (line.size() > 10 && line.substr(0, 10) == "### Phase ") {
+            phases.emplace_back();
+            cur = &phases.back();
+            active_field = "";
+            // Parse "N: Name"
+            std::string rest = line.substr(10);
+            size_t colon = rest.find(':');
+            if (colon != std::string::npos) {
+                try { cur->number = std::stoi(rest.substr(0, colon)); } catch (...) {}
+                cur->name = strip(rest.substr(colon + 1));
+            } else {
+                try { cur->number = std::stoi(rest); } catch (...) {}
+            }
+            continue;
+        }
+
+        if (!cur) continue;
+
+        // Check for **Field:** patterns
+        std::string val;
+        if (field_match(line, "Agent", val)) {
+            cur->agent = val;
+            active_field = "";
+        } else if (field_match(line, "Depends on", val)) {
+            parse_depends(val, cur->depends_on);
+            active_field = "";
+        } else if (field_match(line, "Task", val)) {
+            cur->task = val;
+            active_field = "task";
+        } else if (field_match(line, "Output", val)) {
+            cur->output_desc = val;
+            active_field = "";
+        } else if (field_match(line, "Acceptance", val)) {
+            cur->acceptance = val;
+            active_field = "";
+        } else if (!active_field.empty()) {
+            // Continuation line for a multi-line field
+            if (active_field == "task" && !line.empty()) {
+                cur->task += "\n" + line;
+            }
+        }
+    }
+
+    return phases;
+}
+
+Orchestrator::PlanResult Orchestrator::execute_plan(
+    const std::string& plan_path,
+    std::function<void(const std::string&)> progress)
+{
+    PlanResult result;
+
+    // Read plan file
+    std::ifstream f(plan_path);
+    if (!f.is_open()) {
+        result.ok = false;
+        result.error = "Cannot open plan file: " + plan_path;
+        return result;
+    }
+    std::ostringstream buf;
+    buf << f.rdbuf();
+    std::string plan_text = buf.str();
+
+    auto phases = parse_plan(plan_text);
+    if (phases.empty()) {
+        result.ok = false;
+        result.error = "No phases found in plan: " + plan_path;
+        return result;
+    }
+
+    // Index phases by number for dependency lookup
+    std::unordered_map<int, const PlanPhase*> by_number;
+    for (auto& p : phases) by_number[p.number] = &p;
+
+    // Collected outputs keyed by phase number
+    std::unordered_map<int, std::string> outputs;
+
+    // Execute phases in order (they are already listed in dependency order
+    // by the planner; if a dependency hasn't run yet, we halt).
+    int total = static_cast<int>(phases.size());
+    for (int i = 0; i < total; ++i) {
+        auto& phase = phases[i];
+
+        if (phase.agent.empty()) {
+            result.ok = false;
+            result.error = "Phase " + std::to_string(phase.number) +
+                           " (" + phase.name + ") has no agent assignment.";
+            return result;
+        }
+
+        // Validate agent exists (skip "direct" — handled inline)
+        bool is_direct = (phase.agent == "direct");
+        if (!is_direct && phase.agent != "claudius" && !has_agent(phase.agent)) {
+            result.ok = false;
+            result.error = "Phase " + std::to_string(phase.number) +
+                           ": agent '" + phase.agent + "' not loaded.";
+            return result;
+        }
+
+        // Verify all dependencies have completed
+        for (int dep : phase.depends_on) {
+            if (outputs.find(dep) == outputs.end()) {
+                result.ok = false;
+                result.error = "Phase " + std::to_string(phase.number) +
+                               " depends on Phase " + std::to_string(dep) +
+                               " which has not completed (check plan order).";
+                return result;
+            }
+        }
+
+        // Build task message — inject dependency outputs
+        std::string task_msg = phase.task;
+        if (!phase.depends_on.empty()) {
+            std::ostringstream ctx;
+            ctx << "[PRIOR PHASE OUTPUTS]\n";
+            for (int dep : phase.depends_on) {
+                auto it = outputs.find(dep);
+                if (it == outputs.end()) continue;
+                auto dep_phase = by_number.find(dep);
+                std::string dep_name = (dep_phase != by_number.end())
+                    ? dep_phase->second->name : std::to_string(dep);
+                ctx << "Phase " << dep << " (" << dep_name << "):\n"
+                    << it->second << "\n\n";
+            }
+            ctx << "[END PRIOR PHASE OUTPUTS]\n\n"
+                << "TASK:\n" << phase.task;
+            task_msg = ctx.str();
+        }
+
+        if (progress) {
+            std::string notice = "[plan] phase " + std::to_string(i + 1) + "/" +
+                                 std::to_string(total) + ": " + phase.agent +
+                                 " — " + phase.name;
+            progress(notice);
+        }
+
+        std::string output;
+        if (is_direct) {
+            // "direct" phases: the task is a shell command
+            output = cmd_exec(task_msg);
+        } else {
+            auto resp = send_internal(phase.agent, task_msg, 0);
+            if (!resp.ok) {
+                result.ok = false;
+                result.error = "Phase " + std::to_string(phase.number) +
+                               " (" + phase.agent + ") failed: " + resp.error;
+                return result;
+            }
+            output = resp.content;
+        }
+
+        outputs[phase.number] = output;
+        result.phases.emplace_back(phase.number, phase.name, output);
+
+        if (progress) {
+            progress("[plan] phase " + std::to_string(phase.number) + " complete");
+        }
+    }
+
+    return result;
 }
 
 // ─── Session persistence ──────────────────────────────────────────────────────

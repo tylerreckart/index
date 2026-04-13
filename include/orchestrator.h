@@ -70,6 +70,39 @@ public:
     // Global stats
     std::string global_status() const;
 
+    // Context compaction — summarize and clear one agent's history.
+    // Returns the summary text, or "" if history was empty or the API call failed.
+    // Works for "claudius" (master) and any loaded agent.
+    std::string compact_agent(const std::string& agent_id);
+
+    // ── Plan execution ──────────────────────────────────────────────────────────
+    // Parse a plan markdown file (produced by the planner agent) and execute each
+    // phase deterministically.  Phases run in dependency order; each phase's output
+    // is injected into the task message of all phases that depend on it.
+    //
+    // progress_cb fires after each phase with a one-line status string.
+    // Returns a report summarising what ran and what (if anything) failed.
+
+    struct PlanPhase {
+        int number = 0;
+        std::string name;
+        std::string agent;          // agent id to invoke
+        std::vector<int> depends_on;
+        std::string task;           // instruction passed to agent
+        std::string output_desc;
+        std::string acceptance;
+    };
+
+    struct PlanResult {
+        bool ok = true;
+        std::string error;
+        // Ordered results per phase: (phase number, phase name, agent output)
+        std::vector<std::tuple<int, std::string, std::string>> phases;
+    };
+
+    PlanResult execute_plan(const std::string& plan_path,
+                            std::function<void(const std::string&)> progress = nullptr);
+
     // Session persistence — save/restore all agent conversation histories.
     // Histories are stored as JSON at the given path; agent configs come from
     // the normal .json files and are not duplicated in the session file.

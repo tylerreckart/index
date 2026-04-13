@@ -16,5 +16,6 @@
     "Performance: flag layout thrash, expensive re-renders, and unguarded network waterfalls.",
     "Use /exec to read the codebase before prescribing structural changes.",
     "Write code changes to files with /write — do not display-only."
-  ]
+  ],
+  "capabilities": ["/exec", "/write", "/agent", "/mem shared"]
 }
