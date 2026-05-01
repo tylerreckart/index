@@ -1,16 +1,4 @@
-<p align="center">
-  <img src="./content/index.png" width="64">
-</p>
-<h1 align="center">Index</h1>
-
-<p align="center">
-  <strong>A lean agent orchestration runtime and TUI.</strong>
-</p>
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg" alt="License"></a>
-  <img src="https://img.shields.io/github/tag/tylerreckart/index" alt="Current tag">
-</p>
+# Index
 
 Index is a terminal-native multi-agent system built around token efficiency. Match the model to the task and pair cheap executors with smarter advisor models. It runs a full-screen TUI with a persistent header, a command queue so you can type while agents are working, and a depth-limited delegation chain that lets the master agent dispatch tasks to specialists.
 
@@ -249,4 +237,4 @@ index --send reviewer "review: if (arr.length = 0) return;"
 
 ## License
 
-CC BY-NC 4.0
+Apache 2.0
